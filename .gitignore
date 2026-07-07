@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+panel_db.json
+*.log
+.vscode/
+.idea/
