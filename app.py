@@ -328,6 +328,21 @@ async def api_login(request: Request):
     resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
     return resp
 
+@app.post("/api/change-password")
+async def api_change_password(request: Request, token: str = Depends(require_auth)):
+    body = await request.json()
+    current = str(body.get("current") or "")
+    new_pw = str(body.get("new") or "")
+    if not current or not new_pw:
+        raise HTTPException(status_code=400, detail="Both fields required")
+    if len(new_pw) < 4:
+        raise HTTPException(status_code=400, detail="Password too short (min 4)")
+    if hash_password(current) != AUTH["password_hash"]:
+        raise HTTPException(status_code=401, detail="Current password is wrong")
+    AUTH["password_hash"] = hash_password(new_pw)
+    save_db()
+    return {"ok": True}
+
 @app.post("/api/logout")
 async def api_logout(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -1270,6 +1285,9 @@ body[dir="rtl"] .tbl thead th{text-align:right}
       <div class="nav-item" id="theme-btn-desk" onclick="toggleTheme()" title="Theme">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
       </div>
+      <div class="nav-item" data-page="settings" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </div>
       <div class="nav-item" onclick="doLogout()" title="Logout">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
       </div>
@@ -1376,6 +1394,33 @@ body[dir="rtl"] .tbl thead th{text-align:right}
     </section>
 
     <!-- Traffic Page -->
+    <section class="page" id="page-settings">
+      <div class="page-header">
+        <div>
+          <div class="page-title" data-en="Settings" data-fa="\u062a\u0646\u0638\u06cc\u0645\u0627\u062a">Settings</div>
+          <div class="page-sub" data-en="Change panel password" data-fa="\u062a\u063a\u06cc\u06cc\u0631 \u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u067e\u0646\u0644">Change panel password</div>
+        </div>
+      </div>
+      <div class="card" style="max-width:460px">
+        <div class="card-hd"><div class="card-title" data-en="Change Password" data-fa="\u062a\u063a\u06cc\u06cc\u0631 \u0631\u0645\u0632 \u0639\u0628\u0648\u0631">Change Password</div></div>
+        <div class="fg">
+          <label class="fl" data-en="CURRENT PASSWORD" data-fa="\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0641\u0639\u0644\u06cc">CURRENT PASSWORD</label>
+          <input class="fi" type="password" id="pw-current" placeholder="********">
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="NEW PASSWORD" data-fa="\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u062c\u062f\u06cc\u062f">NEW PASSWORD</label>
+          <input class="fi" type="password" id="pw-new" placeholder="********">
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="CONFIRM NEW PASSWORD" data-fa="\u062a\u0623\u06cc\u06cc\u062f \u0631\u0645\u0632 \u062c\u062f\u06cc\u062f">CONFIRM NEW PASSWORD</label>
+          <input class="fi" type="password" id="pw-confirm" placeholder="********" onkeydown="if(event.key==='Enter')doChangePw()">
+        </div>
+        <button class="btn btn-primary" onclick="doChangePw()" data-en="Update Password" data-fa="\u0628\u0647\u200c\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06cc \u0631\u0645\u0632 \u0639\u0628\u0648\u0631" style="margin-top:6px">Update Password</button>
+        <div id="pw-err" style="color:var(--red);font-size:12px;margin-top:10px;display:none"></div>
+        <div id="pw-ok" style="color:var(--green);font-size:12px;margin-top:10px;display:none" data-en="Password changed successfully" data-fa="\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0628\u0627 \u0645\u0648\u0641\u0642\u06cc\u062a \u062a\u063a\u06cc\u06cc\u0631 \u06a9\u0631\u062f">Password changed successfully</div>
+      </div>
+    </section>
+
     <section class="page" id="page-traffic">
       <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="\u062a\u0631\u0627\u0641\u06cc\u06a9">Traffic</div><div class="page-sub" data-en="Statistics &amp; inbound comparison" data-fa="\u0622\u0645\u0627\u0631 \u0648 \u0645\u0642\u0627\u06cc\u0633\u0647 \u0645\u0635\u0631\u0641 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646">Statistics & inbound comparison</div></div></div>
       <div class="grid-2" style="margin-bottom:14px">
@@ -1548,6 +1593,18 @@ async function doLogin(){
   }catch(e){$m('login-err').style.display='block';}
 }
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
+async function doChangePw(){
+  const cur=$m('pw-current').value,nw=$m('pw-new').value,cf=$m('pw-confirm').value;
+  $m('pw-err').style.display='none';$m('pw-ok').style.display='none';
+  if(!cur||!nw||!cf){$m('pw-err').textContent=lang==='fa'?'\u0647\u0645\u0647 \u0641\u06cc\u0644\u062f \u0631\u0627 \u067e\u0631 \u06a9\u0646\u06cc\u062f':'All fields are required';$m('pw-err').style.display='block';return;}
+  if(nw.length<4){$m('pw-err').textContent=lang==='fa'?'\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u062e\u0648\u0628 \u0627\u0633\u062a (\u062d\u062f\u0627\u0642\u0644 4)':'Password too short (min 4)';$m('pw-err').style.display='block';return;}
+  if(nw!==cf){$m('pw-err').textContent=lang==='fa'?'\u0631\u0645\u0632 \u062c\u062f\u06cc\u062f \u0645\u062a\u0641\u0627\u0648\u062a \u062f\u0627\u0631\u062f':'New passwords do not match';$m('pw-err').style.display='block';return;}
+  try{
+    const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:cur,new:nw})});
+    if(r.ok){$m('pw-current').value='';$m('pw-new').value='';$m('pw-confirm').value='';$m('pw-ok').style.display='block';}
+    else{const d=await r.json();$m('pw-err').textContent=d.detail||'Error';$m('pw-err').style.display='block';}
+  }catch(e){$m('pw-err').textContent='Error';$m('pw-err').style.display='block';}
+}
 
 // Navigation
 document.querySelectorAll('.nav-item[data-page]').forEach(el=>{el.addEventListener('click',()=>switchPage(el.dataset.page));});
