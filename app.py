@@ -129,12 +129,11 @@ async def require_auth(request: Request):
 # ── Keep-alive ─────────────────────────────────────────────────────────────────
 async def keep_alive():
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(600)
         try:
             domain = get_domain()
             if domain and domain != "localhost":
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.get(f"https://{domain}/health")
+                await http_client.get(f"https://{domain}/health")
         except Exception:
             pass
 
@@ -143,8 +142,8 @@ async def keep_alive():
 async def startup():
     global http_client
     load_db()
-    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
-    timeout = httpx.Timeout(30.0, connect=10.0)
+    limits = httpx.Limits(max_connections=50, max_keepalive_connections=10)
+    timeout = httpx.Timeout(15.0, connect=5.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     asyncio.create_task(keep_alive())
     await ensure_default_link()
@@ -288,7 +287,7 @@ async def get_internal_stats():
     mem_p = 0.0
     if HAS_PSUTIL:
         try:
-            cpu_p = psutil.cpu_percent(interval=0.1)
+            cpu_p = psutil.cpu_percent(interval=0)
             mem_p = psutil.virtual_memory().percent
         except Exception:
             pass
@@ -1495,7 +1494,7 @@ function updChart(){if(!tC||!sData.hourly_traffic)return;var e=Object.entries(sD
 function updDaily(){if(!dC||!sData.daily_traffic)return;var e=Object.entries(sData.daily_traffic).sort(function(a,b){return a[0].localeCompare(b[0]);}).slice(-14);dC.data.labels=e.map(function(x){return x[0];});dC.data.datasets[0].data=e.map(function(x){return Math.round(x[1]/1048576);});dC.update();}
 
 setTheme(theme);checkAuth();
-var _si;function startPoll(){if(_si)clearInterval(_si);_si=setInterval(function(){if(isAuth){loadStats();loadLinks();}},12000);}startPoll();
+var _si;function startPoll(){if(_si)clearInterval(_si);_si=setInterval(function(){if(isAuth){loadStats();loadLinks();}},30000);}startPoll();
 </script>
 </body>
 </html>"""
