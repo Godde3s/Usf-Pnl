@@ -27,10 +27,10 @@ except ImportError:
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Usf-Pnl")
+logger = logging.getLogger("panel")
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
-app = FastAPI(title="Usf-Pnl", docs_url=None, redoc_url=None)
+app = FastAPI(title="WebApp", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,7 +59,7 @@ http_client: httpx.AsyncClient | None = None
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 
-SESSION_COOKIE = "usf_session"
+SESSION_COOKIE = "sid"
 SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
 DEFAULT_PORT = 443
@@ -180,7 +180,7 @@ def get_domain() -> str:
         return f"{d}-koyeb.apps.koyeb.com"
     return "localhost"
 
-def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None, port: int = None) -> str:
+def generate_vless_link(uuid: str, remark: str = "Node", address: str = None, port: int = None) -> str:
     domain = get_domain()
     addr = address if address else domain
     use_port = port if port else DEFAULT_PORT
@@ -374,7 +374,7 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"Usf-{data['label']}", port=DEFAULT_PORT),
+            "vless_link": generate_vless_link(uid, remark=f"{data['label']}", port=DEFAULT_PORT),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -426,7 +426,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "active": True,
         "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"Usf-{label}", port=DEFAULT_PORT),
+        "vless_link": generate_vless_link(uid, remark=f"{label}", port=DEFAULT_PORT),
     }
 
 @app.put("/api/links/{uid}")
@@ -524,7 +524,7 @@ def generate_sub_landing_page(link: dict, uid: str) -> str:
         if exp_dt and exp_dt < datetime.now(timezone.utc):
             is_active = False
 
-    config = generate_vless_link(uid, remark=f"Usf-{link['label']}", port=DEFAULT_PORT)
+    config = generate_vless_link(uid, remark=f"{link['label']}", port=DEFAULT_PORT)
     config_json = json.dumps(config)
 
     html = f"""<!DOCTYPE html>
@@ -532,7 +532,7 @@ def generate_sub_landing_page(link: dict, uid: str) -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Usf-Pnl Connection Status</title>
+    <title>Connection Status</title>
     <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
         * {{ margin:0; padding:0; box-sizing:border-box; }}
@@ -654,8 +654,8 @@ def generate_sub_landing_page(link: dict, uid: str) -> str:
             <svg viewBox="0 0 24 24" fill="none" stroke="#A78BFA" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
-            <h1>USF-PNL</h1>
-            <p>@UsfPnl</p>
+            <h1>PANEL</h1>
+            <p>Panel</p>
         </div>
         <div class="card">
             <div class="user-header">
@@ -740,7 +740,7 @@ def generate_subscription_content(link: dict, uid: str) -> str:
         expiry_str = f"{secs_left // 86400} Days Left"
     status_node = generate_vless_link(uid, remark=f"\U0001f4ca {usage_str} | \u23f3 {expiry_str}", address="0.0.0.0", port=DEFAULT_PORT)
     links_out = [status_node]
-    links_out.append(generate_vless_link(uid, remark=f"Usf-{link['label']}", port=DEFAULT_PORT))
+    links_out.append(generate_vless_link(uid, remark=f"{link['label']}", port=DEFAULT_PORT))
     return "\n".join(links_out)
 
 @app.get("/sub/{uid}")
@@ -1041,7 +1041,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title data-en="Usf-Pnl" data-fa="Usf-Pnl">Usf-Pnl</title>
+<title data-en="Panel" data-fa="پنل">Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -1260,7 +1260,7 @@ body[dir="rtl"] .tbl thead th{text-align:right}
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
       </svg>
     </div>
-    <div class="login-title">USF-PNL</div>
+    <div class="login-title">PANEL</div>
     <div class="login-sub" data-en="Secure VLESS Proxy Panel" data-fa="\u067e\u0646\u0644 \u067e\u0631\u0648\u06a9\u0633\u06cc VLESS \u0627\u0645\u0646">Secure VLESS Proxy Panel</div>
     <div class="login-err" id="login-err" data-en="Invalid password" data-fa="\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0627\u0634\u062a\u0628\u0627\u0647 \u0627\u0633\u062a">Invalid password</div>
     <div class="fg">
@@ -1509,8 +1509,8 @@ const langMap={
 };
 function tr(key){return(langMap[lang]&&langMap[lang][key])||langMap['en'][key]||key;}
 
-let lang=localStorage.getItem('usf_lang')||'en';
-let theme=localStorage.getItem('usf_theme')||'dark';
+let lang=localStorage.getItem('p_lang')||'en';
+let theme=localStorage.getItem('p_theme')||'dark';
 let allLinks=[];
 let cf='all';
 let sData={};
@@ -1525,7 +1525,7 @@ function setTheme(t){
   theme=t;
   if(t==='light')document.body.classList.add('light-mode');
   else document.body.classList.remove('light-mode');
-  localStorage.setItem('usf_theme',t);
+  localStorage.setItem('p_theme',t);
   const mb=$m('theme-btn-mob');
   const db=$m('theme-btn-desk');
   if(mb)mb.querySelector('span').textContent=lang==='fa'?(t==='light'?'\u0631\u0648\u0634\u0646':'\u062a\u0627\u0631\u06cc\u06a9'):(t==='light'?'Light':'Dark');
@@ -1551,7 +1551,7 @@ function setLang(l){
     const v=el.getAttribute('data-ph-'+l);
     if(v)el.placeholder=v;
   });
-  localStorage.setItem('usf_lang',l);
+  localStorage.setItem('p_lang',l);
   filterLinks();
   setTheme(theme);
 }
@@ -1687,7 +1687,7 @@ async function cpSub(uid){
 }
 
 function showQR(txt){if(!txt){toast('No QR data',true);return;}$m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
-function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='usf-qr.png';a.click();}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='qr.png';a.click();}
 
 // Stats API
 async function loadStats(){
