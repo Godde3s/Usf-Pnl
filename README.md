@@ -10,7 +10,7 @@
 
 A modern VLESS proxy management panel optimized for **Hugging Face Spaces**. Deploy your own panel with a single token — no server, no domain, no configuration needed.
 
-**Panel Builder:** [https://godde3s.github.io/Usf-Pnl/](https://godde3s.github.io/Usf-Pnl/)
+**Panel Builder:** [https://godde3s.github.io/Usf-Pnl-pro/](https://godde3s.github.io/Usf-Pnl-pro/)
 
 ### Features
 
