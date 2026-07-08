@@ -7,6 +7,7 @@ import time
 import re
 import base64
 import socket
+import uuid as uuid_lib
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -129,11 +130,12 @@ async def require_auth(request: Request):
 # ── Keep-alive ─────────────────────────────────────────────────────────────────
 async def keep_alive():
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(300)
         try:
             domain = get_domain()
             if domain and domain != "localhost":
-                await http_client.get(f"https://{domain}/health")
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.get(f"https://{domain}/health")
         except Exception:
             pass
 
@@ -142,8 +144,8 @@ async def keep_alive():
 async def startup():
     global http_client
     load_db()
-    limits = httpx.Limits(max_connections=50, max_keepalive_connections=10)
-    timeout = httpx.Timeout(15.0, connect=5.0)
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
+    timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     asyncio.create_task(keep_alive())
     await ensure_default_link()
@@ -155,11 +157,28 @@ async def shutdown():
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def get_domain() -> str:
-    return (
-        os.environ.get("SPACE_HOST", "localhost")
-        .replace("https://", "").replace("http://", "")
-        .split("/")[0]
-    )
+    """Detect domain from platform env vars (order: HF > Render > Railway > Fly > Koyeb > request host)."""
+    # HuggingFace Spaces
+    d = os.environ.get("SPACE_HOST", "")
+    if d:
+        return d.replace("https://", "").replace("http://", "").split("/")[0]
+    # Render
+    d = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if d:
+        return d.replace("https://", "").replace("http://", "").split("/")[0]
+    # Railway
+    d = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if d:
+        return d.replace("https://", "").replace("http://", "").split("/")[0]
+    # Fly.io
+    d = os.environ.get("FLY_APP_NAME", "")
+    if d:
+        return f"{d}.fly.dev"
+    # Koyeb
+    d = os.environ.get("KOYEB_SERVICE_NAME", "")
+    if d:
+        return f"{d}-koyeb.apps.koyeb.com"
+    return "localhost"
 
 def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None, port: int = None) -> str:
     domain = get_domain()
@@ -242,7 +261,7 @@ def fmt_exp_py(ea: str | None) -> str:
 async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
-            LINKS["Default"] = {
+            LINKS[str(uuid_lib.uuid4())] = {
                 "label": "Default",
                 "limit_bytes": 0,
                 "used_bytes": 0,
@@ -287,7 +306,7 @@ async def get_internal_stats():
     mem_p = 0.0
     if HAS_PSUTIL:
         try:
-            cpu_p = psutil.cpu_percent(interval=0)
+            cpu_p = psutil.cpu_percent(interval=0.1)
             mem_p = psutil.virtual_memory().percent
         except Exception:
             pass
@@ -326,21 +345,6 @@ async def api_login(request: Request):
     resp = JSONResponse({"ok": True})
     resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
     return resp
-
-@app.post("/api/change-password")
-async def api_change_password(request: Request, token: str = Depends(require_auth)):
-    body = await request.json()
-    current = str(body.get("current") or "")
-    new_pw = str(body.get("new") or "")
-    if not current or not new_pw:
-        raise HTTPException(status_code=400, detail="Both fields required")
-    if len(new_pw) < 4:
-        raise HTTPException(status_code=400, detail="Password too short (min 4)")
-    if hash_password(current) != AUTH["password_hash"]:
-        raise HTTPException(status_code=401, detail="Current password is wrong")
-    AUTH["password_hash"] = hash_password(new_pw)
-    save_db()
-    return {"ok": True}
 
 @app.post("/api/logout")
 async def api_logout(request: Request):
@@ -401,7 +405,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
         except (ValueError, TypeError):
             pass
-    uid = label
+    uid = str(uuid_lib.uuid4())
     async with LINKS_LOCK:
         LINKS[uid] = {
             "label": label,
@@ -488,14 +492,12 @@ async def get_sub_link(uid: str, _=Depends(require_auth)):
     return {"sub_url": sub_url}
 
 # ── Subscription Page Generator ────────────────────────────────────────────────
-
-
 def generate_sub_landing_page(link: dict, uid: str) -> str:
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     expires_at_str = link.get("expires_at")
 
-    usage_str = "{0} / Unlimited".format(_fmt_bytes(used)) if limit == 0 else "{0} / {1}".format(_fmt_bytes(used), _fmt_bytes(limit))
+    usage_str = f"{_fmt_bytes(used)} / Unlimited" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     pct = round((used / limit) * 100, 1) if limit > 0 else 0
     rem = limit - used if limit > 0 else -1
     rem_str = _fmt_bytes(rem) if rem >= 0 else "Unlimited"
@@ -510,11 +512,11 @@ def generate_sub_landing_page(link: dict, uid: str) -> str:
         hours = (secs_left % 86400) // 3600
         mins = (secs_left % 3600) // 60
         if days > 0:
-            expiry_str = "{0}d {1}h remaining".format(days, hours)
+            expiry_str = f"{days} Days, {hours} Hours Left"
         elif hours > 0:
-            expiry_str = "{0}h {1}m remaining".format(hours, mins)
+            expiry_str = f"{hours} Hours, {mins} Minutes Left"
         else:
-            expiry_str = "{0}m remaining".format(mins)
+            expiry_str = f"{mins} Minutes Left"
 
     is_active = link["active"]
     if is_active and expires_at_str:
@@ -522,97 +524,207 @@ def generate_sub_landing_page(link: dict, uid: str) -> str:
         if exp_dt and exp_dt < datetime.now(timezone.utc):
             is_active = False
 
-    config = generate_vless_link(uid, remark="Usf-{0}".format(link['label']), port=DEFAULT_PORT)
+    config = generate_vless_link(uid, remark=f"Usf-{link['label']}", port=DEFAULT_PORT)
     config_json = json.dumps(config)
-    status_badge_class = 'badge-on' if is_active else 'badge-off'
-    status_text = 'Active' if is_active else 'Inactive'
 
-    html = """<!DOCTYPE html>
-<html lang="en" dir="ltr">
+    html = f"""<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5">
-<title>Usf-Pnl | Connection Status</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{background:#0b1120;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#e2e8f0;min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:16px}
-.card{width:100%;max-width:420px;background:rgba(15,23,42,.95);border:1px solid rgba(6,182,212,.1);border-radius:14px;padding:24px 20px;position:relative}
-.hdr{text-align:center;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid rgba(148,163,184,.08)}
-.hdr h1{font-size:18px;font-weight:700;color:#22d3ee;letter-spacing:.8px}
-.hdr p{font-size:11px;color:#64748b;margin-top:3px}
-.row{display:flex;justify-content:space-between;align-items:center;padding:8px 0}
-.lbl{font-size:12px;color:#94a3b8}
-.val{font-size:13px;font-weight:600;color:#e2e8f0}
-.badge{padding:2px 10px;border-radius:20px;font-size:10px;font-weight:700;white-space:nowrap}
-.badge-on{background:rgba(52,211,153,.1);color:#34d399;border:1px solid rgba(52,211,153,.2)}
-.badge-off{background:rgba(251,113,133,.1);color:#fb7185;border:1px solid rgba(251,113,133,.2)}
-.pbar{height:6px;background:rgba(148,163,184,.06);border-radius:3px;overflow:hidden;margin:6px 0 3px}
-.pfill{height:100%;border-radius:3px;background:linear-gradient(90deg,#06b6d4,#22d3ee);will-change:width}
-.sec{font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:1.2px;margin:16px 0 10px}
-.node{display:flex;align-items:center;justify-content:space-between;background:rgba(30,41,59,.6);border:1px solid rgba(148,163,184,.06);border-radius:8px;padding:10px 12px;gap:8px}
-.node-name{font-size:12px;font-weight:600;color:#cbd5e1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
-.node-acts{display:flex;gap:6px;flex-shrink:0}
-.btn{font-family:inherit;font-size:11px;font-weight:600;border-radius:6px;padding:5px 12px;cursor:pointer;border:none}
-.btn-p{background:#06b6d4;color:#0b1120}
-.btn-o{background:transparent;color:#94a3b8;border:1px solid rgba(148,163,184,.15)}
-.ov{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center}
-.ov.show{display:flex}
-.ov-box{background:#0f172a;border:1px solid rgba(6,182,212,.12);border-radius:14px;padding:20px;width:90%;max-width:280px;text-align:center;position:relative}
-.ov-box img{max-width:100%;border-radius:6px;margin-top:12px}
-.ov-x{position:absolute;top:8px;right:8px;width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;cursor:pointer;color:#64748b;background:none;border:none;font-size:16px}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0f172a;color:#22d3ee;border:1px solid rgba(6,182,212,.15);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;opacity:0;z-index:999;pointer-events:none}
-.toast.show{opacity:1}
-.usage-row{display:flex;justify-content:space-between;margin-top:1px}
-.usage-row span{font-size:10px;color:#94a3b8}
-.divider{border:none;border-top:1px solid rgba(148,163,184,.06);margin:12px 0}
-@media(max-width:360px){.card{padding:18px 14px;border-radius:10px}.hdr h1{font-size:16px}.node{padding:8px 10px}.btn{font-size:10px;padding:4px 10px}}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Usf-Pnl Connection Status</title>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {{ margin:0; padding:0; box-sizing:border-box; }}
+        body {{
+            background: #060608;
+            font-family: 'Inter', 'Vazirmatn', sans-serif;
+            color: rgba(255,255,255,0.92);
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }}
+        .bg-glow {{
+            position: fixed; inset: 0; z-index: 0; pointer-events: none;
+            background: radial-gradient(ellipse 70% 50% at 50% -10%, rgba(139,92,246,0.12), transparent 60%);
+        }}
+        .container {{
+            width: 100%; max-width: 500px;
+            background: rgba(12,12,18,0.97);
+            border: 1px solid rgba(139,92,246,0.15);
+            border-radius: 20px; padding: 24px;
+            box-shadow: 0 0 24px rgba(139,92,246,0.1);
+            position: relative; z-index: 1;
+        }}
+        .brand {{ text-align: center; margin-bottom: 20px; }}
+        .brand svg {{ width: 40px; height: 40px; margin-bottom: 8px; }}
+        .brand h1 {{
+            font-family: 'Cinzel', serif; font-size: 22px;
+            color: #A78BFA; letter-spacing: 2px;
+        }}
+        .brand p {{ font-size: 12px; color: rgba(255,255,255,0.35); margin-top: 4px; }}
+        .card {{
+            background: rgba(20,20,28,0.9);
+            border: 1px solid rgba(139,92,246,0.08);
+            border-radius: 14px; padding: 16px; margin-bottom: 14px;
+        }}
+        .user-header {{
+            display: flex; align-items: center;
+            justify-content: space-between; margin-bottom: 12px;
+        }}
+        .username {{ font-size: 18px; font-weight: 700; color: #fff; }}
+        .status-badge {{
+            padding: 3px 8px; border-radius: 6px;
+            font-size: 10px; font-weight: 800; text-transform: uppercase;
+        }}
+        .status-active {{ background: rgba(74,222,128,0.15); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }}
+        .status-expired {{ background: rgba(248,113,113,0.15); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }}
+        .label {{ font-size: 11px; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 1px; }}
+        .val {{ font-size: 16px; font-weight: 600; color: #fff; margin-top: 2px; }}
+        .progress-bar {{
+            height: 6px; background: rgba(255,255,255,0.05);
+            border-radius: 3px; overflow: hidden; margin: 12px 0;
+        }}
+        .progress-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, #8B5CF6, #A78BFA);
+            transition: width 0.5s;
+        }}
+        .config-list {{ margin-top: 15px; }}
+        .config-item {{
+            display: flex; align-items: center; justify-content: space-between;
+            background: rgba(28,28,40,0.8);
+            border: 1px solid rgba(255,255,255,0.05);
+            padding: 10px 12px; border-radius: 8px; margin-bottom: 8px;
+            font-size: 12.5px;
+        }}
+        .config-name {{
+            font-weight: 600; color: rgba(255,255,255,0.8);
+            overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; max-width: 60%;
+        }}
+        .btn {{
+            font-family: inherit; font-size: 11.5px; font-weight: 700;
+            border-radius: 6px; padding: 5px 10px; cursor: pointer;
+            border: none; transition: all 0.2s;
+        }}
+        .btn-purple {{ background: #8B5CF6; color: #fff; }}
+        .btn-purple:hover {{ background: #7C3AED; }}
+        .btn-ghost {{ background: rgba(255,255,255,0.05); color: #fff; border: 1px solid rgba(255,255,255,0.1); }}
+        .btn-ghost:hover {{ background: rgba(255,255,255,0.1); }}
+        .mo {{
+            position: fixed; inset: 0; background: rgba(0,0,0,0.8);
+            z-index: 200; display: none; align-items: center;
+            justify-content: center; backdrop-filter: blur(8px);
+        }}
+        .mo.show {{ display: flex; }}
+        .mo-box {{
+            background: rgba(20,20,28,0.95);
+            border: 1px solid rgba(139,92,246,0.2);
+            border-radius: 18px; padding: 24px; width: 90%;
+            max-width: 320px; text-align: center; position: relative;
+        }}
+        .mo-box img {{
+            max-width: 100%; border-radius: 8px;
+            border: 3px solid rgba(139,92,246,0.15); margin-top: 15px;
+        }}
+        .mo-close {{
+            position: absolute; top: 12px; right: 12px; font-size: 16px;
+            cursor: pointer; color: rgba(255,255,255,0.4); background: none; border: none;
+        }}
+        .toast {{
+            position: fixed; bottom: 20px; left: 50%;
+            transform: translateX(-50%) translateY(16px);
+            background: #0c0c10; color: #A78BFA;
+            border: 1px solid rgba(139,92,246,0.2);
+            border-radius: 10px; padding: 10px 18px;
+            font-size: 13px; font-weight: 600; opacity: 0;
+            transition: all 0.3s; z-index: 999;
+        }}
+        .toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+    </style>
 </head>
 <body>
-<div class="card">
-  <div class="hdr"><h1>USF-PNL</h1><p>Connection Status</p></div>
-  <div class="row">
-    <span class="lbl">Username</span>
-    <div style="display:flex;align-items:center;gap:6px">
-      <span class="val">""" + link['label'] + """</span>
-      <span class="badge """ + status_badge_class + """">""" + status_text + """</span>
+    <div class="bg-glow"></div>
+    <div class="toast" id="toast">Copied!</div>
+    <div class="container">
+        <div class="brand">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#A78BFA" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            <h1>USF-PNL</h1>
+            <p>@UsfPnl</p>
+        </div>
+        <div class="card">
+            <div class="user-header">
+                <span class="username">{link['label']}</span>
+                <span class="status-badge {'status-active' if is_active else 'status-expired'}">
+                    {'Active' if is_active else 'Inactive'}
+                </span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" style="width: {pct}%"></div>
+            </div>
+            <div style="display:flex; justify-content: space-between; margin-top: 10px;">
+                <div>
+                    <div class="label">Usage</div>
+                    <div class="val">{usage_str}</div>
+                </div>
+                <div>
+                    <div class="label">Remaining</div>
+                    <div class="val">{rem_str}</div>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Time Validity / Expiration</div>
+            <div class="val" style="color: #A78BFA; font-size: 18px; font-weight: 700; margin-top: 4px;">{expiry_str}</div>
+        </div>
+        <h3 style="margin: 20px 0 10px 5px; font-size: 14px; letter-spacing: 1px; color: rgba(255,255,255,0.5);">AVAILABLE NODES</h3>
+        <div class="config-list" id="config-list"></div>
     </div>
-  </div>
-  <div class="pbar"><div class="pfill" style="width:""" + str(pct) + """%"></div></div>
-  <div class="usage-row">
-    <span>Used: """ + usage_str + """</span>
-    <span>Remaining: """ + rem_str + """</span>
-  </div>
-  <hr class="divider">
-  <div class="row">
-    <span class="lbl">Time Left</span>
-    <span class="val" style="color:#22d3ee;font-size:14px">""" + expiry_str + """</span>
-  </div>
-  <div class="sec">Available Nodes</div>
-  <div id="node-list"></div>
-</div>
-<div class="ov" id="qr-ov" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="ov-box">
-    <button class="ov-x" onclick="document.getElementById('qr-ov').classList.remove('show')">&#10005;</button>
-    <h3 style="color:#22d3ee;font-size:13px;font-weight:700">QR Code</h3>
-    <img id="qr-img" src="" alt="QR">
-  </div>
-</div>
-<div class="toast" id="toast">Copied!</div>
-<script>
-var config=""" + config_json + """;
-var el=document.getElementById('node-list');
-function toast(t){var d=document.getElementById('toast');d.textContent=t;d.className='toast show';setTimeout(function(){d.className='toast';},2000);}
-function cp(t){navigator.clipboard.writeText(t).then(function(){toast('Copied!');}).catch(function(){toast('Copy failed');});}
-function qr(t){document.getElementById('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=220x220&data='+encodeURIComponent(t);document.getElementById('qr-ov').classList.add('show');}
-var p=config.split('#'),nm=p[1]?decodeURIComponent(p[1]):'Node 1';
-el.innerHTML='<div class="node"><span class="node-name">'+nm+'</span><div class="node-acts"><button class="btn btn-o" onclick="cp(config)">Copy</button><button class="btn btn-p" onclick="qr(config)">QR</button></div></div>';
-</script>
+    <div class="mo" id="qr-modal" onclick="if(event.target===this)this.classList.remove('show')">
+        <div class="mo-box">
+            <button class="mo-close" onclick="document.getElementById('qr-modal').classList.remove('show')">&#10005;</button>
+            <h3 style="color:#A78BFA; font-family:'Cinzel',serif; font-size:14px;">QR Code</h3>
+            <img id="qr-img" src="" alt="QR">
+        </div>
+    </div>
+    <script>
+        const config = {config_json};
+        const listEl = document.getElementById('config-list');
+        function showToast(txt) {{
+            const t = document.getElementById('toast');
+            t.textContent = txt; t.className = 'toast show';
+            clearTimeout(t.timer);
+            t.timer = setTimeout(() => t.className = 'toast', 2500);
+        }}
+        function copyTxt(text) {{
+            navigator.clipboard.writeText(text)
+                .then(() => showToast('Copied Successfully!'))
+                .catch(() => showToast('Failed to copy.'));
+        }}
+        function showQR(text) {{
+            document.getElementById('qr-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=' + encodeURIComponent(text);
+            document.getElementById('qr-modal').classList.add('show');
+        }}
+        const parts = config.split('#');
+        const remark = parts[1] ? decodeURIComponent(parts[1]) : 'Node 1';
+        listEl.innerHTML = `
+            <div class="config-item">
+                <span class="config-name">${{remark}}</span>
+                <div style="display:flex; gap: 5px;">
+                    <button class="btn btn-ghost" onclick="copyTxt(config)">Copy</button>
+                    <button class="btn btn-purple" onclick="showQR(config)">QR</button>
+                </div>
+            </div>
+        `;
+    </script>
 </body>
 </html>"""
     return html
-
 
 def generate_subscription_content(link: dict, uid: str) -> str:
     used = link["used_bytes"]
@@ -874,7 +986,17 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
 
         task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
         task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
-        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
+        # Keepalive: send WebSocket ping every 20s to prevent cloud proxies (Render, etc.)
+        # from killing idle connections. Uses protocol-level ping, not application data.
+        async def ws_keepalive():
+            try:
+                while True:
+                    await asyncio.sleep(20)
+                    await websocket._send({"type": "websocket.ping", "bytes": b""})
+            except Exception:
+                pass
+        task_ping = asyncio.create_task(ws_keepalive())
+        done, pending = await asyncio.wait({task_up, task_down, task_ping}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
             try:
@@ -913,380 +1035,418 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                                 if not link_ip_map[uid]:
                                     link_ip_map.pop(uid, None)
 
-
+# ── PANEL HTML ─────────────────────────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
-<html lang="en" dir="ltr">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5">
-<title>Usf-Pnl</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title data-en="Usf-Pnl" data-fa="Usf-Pnl">Usf-Pnl</title>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
 :root{
-  --pri:#0b1120;--pri2:#111827;--pri3:#1e293b;
-  --surface:rgba(15,23,42,.95);--surface2:rgba(30,41,59,.7);--surface3:rgba(51,65,85,.5);
-  --border:rgba(148,163,184,.07);--border2:rgba(6,182,212,.18);
-  --accent:#06b6d4;--accent2:#22d3ee;--accent3:#0891b2;
-  --accent-dim:rgba(6,182,212,.07);
-  --txt:#e2e8f0;--txt2:#94a3b8;--txt3:#64748b;
-  --green:#34d399;--red:#fb7185;--yellow:#fbbf24;
-  --top-h:52px;--radius:10px;
+  --accent:#8B5CF6;--accent2:#A78BFA;--accent3:#7C3AED;--accent-dim:rgba(139,92,246,0.12);
+  --black:#060608;--black2:#0c0c10;--black3:#111118;
+  --surface:rgba(12,12,18,0.97);--surface2:rgba(20,20,28,0.9);--surface3:rgba(28,28,40,0.8);
+  --border:rgba(139,92,246,0.1);--border2:rgba(139,92,246,0.2);
+  --text:rgba(255,255,255,0.92);--text2:rgba(167,139,250,0.7);--text3:rgba(255,255,255,0.4);
+  --white-neon:rgba(255,255,255,0.85);--white-glow:0 0 16px rgba(255,255,255,0.25);
+  --accent-glow:0 0 20px rgba(139,92,246,0.4);
+  --green:#4ade80;--green-dim:rgba(74,222,128,0.1);
+  --red:#f87171;--red-dim:rgba(248,113,113,0.1);
+  --yellow:#fbbf24;
+  --nav-w:64px;
 }
-body.light{
-  --pri:#f1f5f9;--pri2:#fff;--pri3:#e2e8f0;
-  --surface:rgba(255,255,255,.97);--surface2:rgba(241,245,249,.8);--surface3:rgba(226,232,240,.6);
-  --border:rgba(15,23,42,.07);--border2:rgba(6,182,212,.22);
-  --accent-dim:rgba(6,182,212,.08);
-  --txt:#0f172a;--txt2:#475569;--txt3:#94a3b8;
+body.light-mode {
+  --black:#f0f2f5;--black2:#ffffff;--black3:#e4e6eb;
+  --surface:rgba(255,255,255,0.95);--surface2:#ffffff;--surface3:#f9fafb;
+  --border:rgba(0,0,0,0.1);--border2:rgba(0,0,0,0.2);
+  --text:#111827;--text2:#4b5563;--text3:#6b7280;
+  --accent-dim:rgba(139,92,246,0.15);
+  --accent-glow:0 4px 14px rgba(0,0,0,0.1);
 }
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:var(--pri);color:var(--txt);display:flex;flex-direction:column;min-height:100vh;min-height:100dvh}
-::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(6,182,212,.15);border-radius:4px}
+html,body{height:100%;background:var(--black);transition:background .3s,color .3s}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh}
+body[dir="rtl"]{direction:rtl;text-align:right}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(139,92,246,0.2);border-radius:4px}
+.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 70% 50% at 50% -10%,var(--accent-dim),transparent 60%)}
+.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(128,128,128,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(128,128,128,0.05) 1px,transparent 1px);background-size:56px 56px}
 
-/* Top Bar */
-.topbar{height:var(--top-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;position:sticky;top:0;z-index:100}
-.topbar-r{display:flex;align-items:center;gap:8px}
-.topbar-logo{width:24px;height:24px;color:var(--accent2)}
-.topbar-logo svg{width:100%;height:100%}
-.topbar-brand{font-size:14px;font-weight:700;color:var(--accent2);letter-spacing:.4px}
-.topbar-nav{display:flex;align-items:center;gap:1px}
-.nav-btn{font-family:inherit;font-size:12px;font-weight:600;padding:7px 14px;border-radius:6px;cursor:pointer;border:none;background:0;color:var(--txt3);white-space:nowrap}
-.nav-btn:hover{background:var(--accent-dim);color:var(--txt)}
-.nav-btn.on{background:var(--accent-dim);color:var(--accent2)}
-.topbar-l{display:flex;align-items:center;gap:4px}
-.topbar-icon{width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:6px;cursor:pointer;color:var(--txt3);background:0;border:0}
-.topbar-icon:hover{background:var(--accent-dim);color:var(--txt)}
-.topbar-icon svg{width:16px;height:16px}
-
-/* Main */
-.main{flex:1;padding:20px;max-width:1080px;width:100%;margin:0 auto}
-.page{display:none}.page.on{display:block}
-.page-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px}
-.page-title{font-size:17px;font-weight:700}
-.page-sub{font-size:11px;color:var(--txt3);margin-top:2px}
-
-/* Stat Cards */
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
-.sc{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
-.sc-ic{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;margin-bottom:8px}
-.sc-ic svg{width:14px;height:14px}
-.sc-ic.c1{background:rgba(6,182,212,.08);color:var(--accent2)}
-.sc-ic.c2{background:rgba(52,211,153,.08);color:var(--green)}
-.sc-ic.c3{background:rgba(251,191,36,.08);color:var(--yellow)}
-.sc-ic.c4{background:rgba(251,113,133,.08);color:var(--red)}
-.sc-lbl{font-size:10px;color:var(--txt3);margin-bottom:3px}
-.sc-val{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
-.sc-unit{font-size:10px;font-weight:500;color:var(--txt3)}
-
-/* Card / Grid */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
-.card-title{font-size:11px;font-weight:700;color:var(--txt2);margin-bottom:10px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-
-/* System */
-.sys-row{display:flex;align-items:center;justify-content:space-between;padding:4px 0}
-.sys-k{font-size:11px;color:var(--txt3)}
-.sys-v{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}
-.bar-bg{height:4px;background:rgba(148,163,184,.05);border-radius:2px;overflow:hidden;margin-top:4px}
-.bar-fg{height:100%;border-radius:2px;background:var(--accent2);will-change:width}
-
-/* Chart */
-.chart-box{height:170px;position:relative}
-
-/* Table */
-.toolbar{display:flex;align-items:center;gap:5px;margin-bottom:10px;flex-wrap:wrap}
-.chip{padding:4px 12px;border-radius:16px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:0;color:var(--txt3)}
-.chip.on{background:var(--accent-dim);color:var(--accent2);border-color:var(--border2)}
-.chip:hover{border-color:var(--border2)}
-.search{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--txt);font-size:11px;font-family:inherit;outline:0;min-width:140px}
-.search:focus{border-color:var(--accent)}
-.tbl{width:100%;border-collapse:collapse;font-size:11px}
-.tbl thead th{text-align:left;padding:8px 8px;font-size:10px;font-weight:700;color:var(--txt3);border-bottom:1px solid var(--border);white-space:nowrap}
-.tbl tbody td{padding:8px;border-bottom:1px solid rgba(148,163,184,.03);vertical-align:middle}
-.tbl tbody tr:hover{background:rgba(6,182,212,.02)}
-
-/* Tags / Pills */
-.tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:9px;font-weight:700;letter-spacing:.2px;white-space:nowrap}
-.tag-v{background:var(--accent-dim);color:var(--accent2);border:1px solid rgba(6,182,212,.12)}
-.tag-on{background:rgba(52,211,153,.06);color:var(--green);border:1px solid rgba(52,211,153,.15)}
-.tag-off{background:rgba(251,113,133,.06);color:var(--red);border:1px solid rgba(251,113,133,.15)}
-.pill{display:flex;align-items:center;gap:5px;font-size:10px;min-width:0}
-.pill-used{color:var(--txt2);font-weight:600;white-space:nowrap}
-.pill-bar{flex:1;height:3px;background:rgba(148,163,184,.05);border-radius:2px;overflow:hidden;min-width:30px}
-.pill-fill{height:100%;border-radius:2px}
-.pill-lim{color:var(--txt3);font-size:9px;white-space:nowrap}
-
-/* Toggle */
-.toggle{width:30px;height:16px;border-radius:8px;background:rgba(148,163,184,.12);border:0;cursor:pointer;position:relative;flex-shrink:0}
-.toggle::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff}
-.toggle.on{background:var(--accent)}
-.toggle.on::after{transform:translateX(14px)}
-
-/* Action btns */
-.abtn{font-family:inherit;font-size:9px;font-weight:700;border-radius:4px;padding:3px 6px;cursor:pointer;border:1px solid var(--border);background:0;color:var(--txt3);white-space:nowrap}
-.abtn:hover{border-color:var(--border2);color:var(--txt)}
-.abtn.ae:hover{color:var(--accent2)}
-.abtn.ac:hover{color:var(--green)}
-.abtn.as:hover{color:var(--yellow)}
-.abtn.aq:hover{color:var(--accent2)}
-.abtn.ad:hover{color:var(--red)}
-
-/* Mobile cards (hidden on desktop) */
-.m-cards{display:none}
-.m-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:8px}
-.m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:6px}
-.m-card-name{font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.m-card-acts{display:flex;gap:3px;flex-wrap:wrap}
-.m-card-meta{font-size:10px;color:var(--txt3);margin-top:4px;font-weight:600}
-
-/* Alerts */
-.alerts{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:14px}
-.alert-row{display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-radius:6px;background:var(--surface2);margin-bottom:4px;font-size:11px;gap:8px}
-.alert-row:last-child{margin-bottom:0}
-.alert-row span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-
-/* Buttons */
-.btn{font-family:inherit;font-size:11px;font-weight:700;border-radius:6px;padding:8px 16px;cursor:pointer;border:0;display:inline-flex;align-items:center;gap:4px}
-.btn-p{background:var(--accent);color:#0b1120}.btn-p:hover{background:var(--accent3)}
-.btn-d{background:rgba(251,113,133,.06);color:var(--red);border:1px solid rgba(251,113,133,.15)}.btn-d:hover{background:rgba(251,113,133,.1)}
-.btn-g{background:rgba(148,163,184,.04);color:var(--txt);border:1px solid var(--border)}.btn-g:hover{background:rgba(148,163,184,.08)}
-.btn-sm{font-size:10px;padding:5px 10px}
-
-/* Modal */
-.mo{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;display:none;align-items:center;justify-content:center}
-.mo.show{display:flex}
-.mo-box{background:var(--pri2);border:1px solid var(--border2);border-radius:14px;padding:22px;width:90%;max-width:380px;position:relative}
-.mo-x{position:absolute;top:10px;right:10px;width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:5px;cursor:pointer;color:var(--txt3);background:0;border:0;font-size:13px}
-.mo-x:hover{background:var(--accent-dim);color:var(--txt)}
-.mo-title{font-size:13px;font-weight:700;color:var(--accent2);margin-bottom:16px;text-align:center}
-.qr-box{background:var(--surface3);border-radius:8px;padding:12px;display:flex;justify-content:center}
-.qr-box img{max-width:100%;border-radius:4px}
-.fg{margin-bottom:10px}
-.fl{display:block;font-size:10px;font-weight:700;color:var(--txt3);margin-bottom:3px;letter-spacing:.2px}
-.fi{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:9px 10px;color:var(--txt);font-size:12px;font-family:inherit;outline:0}
+/* ── Login ─────────────────────────────────────────────────────────────────── */
+.login-wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:100;background:var(--black)}
+.login-box{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:40px 32px;width:90%;max-width:380px;text-align:center;position:relative;box-shadow:0 0 60px rgba(139,92,246,0.08)}
+.login-logo{margin-bottom:6px}
+.login-logo svg{width:48px;height:48px;color:var(--accent2)}
+.login-title{font-family:'Cinzel',serif;font-size:24px;color:var(--accent2);letter-spacing:3px;margin-bottom:4px}
+.login-sub{font-size:12px;color:var(--text3);margin-bottom:28px}
+.login-err{display:none;background:var(--red-dim);border:1px solid rgba(248,113,113,0.25);color:var(--red);border-radius:10px;padding:10px 14px;font-size:12.5px;font-weight:600;margin-bottom:14px}
+.fg{margin-bottom:14px;text-align:left}
+.fl{display:block;font-size:11.5px;font-weight:600;color:var(--text3);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px}
+.fi{width:100%;background:var(--surface3);border:1px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:border .2s}
 .fi:focus{border-color:var(--accent)}
-.fr{display:flex;gap:8px}
-.fs{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:9px 10px;color:var(--txt);font-size:12px;font-family:inherit;outline:0;cursor:pointer}
+.btn{font-family:inherit;font-size:12.5px;font-weight:700;border-radius:10px;padding:10px 18px;cursor:pointer;border:none;transition:all .2s;display:inline-flex;align-items:center;gap:5px}
+.btn-accent{background:var(--accent);color:#fff;box-shadow:var(--accent-glow)}
+.btn-accent:hover{background:var(--accent3);transform:translateY(-1px)}
+.btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,0.25)}
+.btn-danger:hover{background:rgba(248,113,113,0.2)}
+.btn-ghost{background:rgba(255,255,255,0.05);color:var(--text);border:1px solid var(--border)}
+.btn-ghost:hover{background:rgba(255,255,255,0.1)}
+.btn-sm{font-size:11px;padding:6px 10px;border-radius:7px}
 
-/* Toast */
-.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--pri2);color:var(--accent2);border:1px solid var(--border2);border-radius:6px;padding:7px 14px;font-size:11px;font-weight:600;opacity:0;z-index:999;pointer-events:none;white-space:nowrap}
-.toast.err{color:var(--red);border-color:rgba(251,113,133,.2)}
-.toast.show{opacity:1}
+/* ── Sidebar ───────────────────────────────────────────────────────────────── */
+.sidebar{width:var(--nav-w);min-height:100vh;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;align-items:center;padding:16px 0;position:fixed;left:0;top:0;z-index:50;transition:transform .3s}
+body[dir="rtl"] .sidebar{left:auto;right:0;border-right:none;border-left:1px solid var(--border)}
+.sb-logo{width:36px;height:36px;margin-bottom:24px;cursor:pointer}
+.sb-logo svg{width:100%;height:100%;color:var(--accent2)}
+.nav-items{display:flex;flex-direction:column;gap:4px;flex:1;width:100%;padding:0 8px}
+.nav-item{width:48px;height:48px;display:flex;align-items:center;justify-content:center;border-radius:12px;cursor:pointer;transition:all .2s;color:var(--text3);position:relative}
+.nav-item:hover{background:var(--accent-dim);color:var(--text)}
+.nav-item.active{background:var(--accent-dim);color:var(--accent2)}
+.nav-item.active::before{content:'';position:absolute;left:-8px;top:50%;transform:translateY(-50%);width:3px;height:20px;background:var(--accent);border-radius:0 3px 3px 0}
+body[dir="rtl"] .nav-item.active::before{left:auto;right:-8px;border-radius:3px 0 0 3px}
+.nav-item svg{width:20px;height:20px}
+.sb-bottom{display:flex;flex-direction:column;gap:4px;padding:0 8px}
 
-/* Empty */
-.empty{text-align:center;padding:28px 16px;color:var(--txt3);font-size:12px}
+/* ── Main Content ──────────────────────────────────────────────────────────── */
+.main{margin-left:var(--nav-w);flex:1;padding:24px 28px;min-height:100vh;position:relative;z-index:1}
+body[dir="rtl"] .main{margin-left:0;margin-right:var(--nav-w)}
+.page{display:none;animation:fadeIn .3s ease}
+.page.active{display:block}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
+.page-title{font-family:'Cinzel',serif;font-size:22px;color:var(--accent2);letter-spacing:1px}
+.page-sub{font-size:12.5px;color:var(--text3);margin-top:3px}
 
-/* ─── RESPONSIVE ──────────────────────────────────────────────── */
+/* ── Cards ─────────────────────────────────────────────────────────────────── */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px;transition:all .3s;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(139,92,246,0.03),transparent 60%);pointer-events:none}
+.card:hover{border-color:var(--border2)}
+.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.card-title{font-size:13px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
 
-/* Tablet landscape */
-@media(max-width:1024px){
-  .stats{grid-template-columns:repeat(2,1fr)}
-}
+/* ── Stat Cards ────────────────────────────────────────────────────────────── */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:20px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;position:relative;overflow:hidden;transition:all .3s}
+.stat-card::after{content:'';position:absolute;top:-50%;right:-50%;width:100%;height:100%;background:radial-gradient(circle,var(--accent-dim),transparent 70%);pointer-events:none}
+.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:var(--accent-glow)}
+.stat-icon{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px}
+.stat-icon svg{width:18px;height:18px}
+.stat-icon.purple{background:var(--accent-dim);color:var(--accent2)}
+.stat-icon.green{background:var(--green-dim);color:var(--green)}
+.stat-icon.red{background:var(--red-dim);color:var(--red)}
+.stat-icon.yellow{background:rgba(251,191,36,0.1);color:var(--yellow)}
+.stat-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.stat-value{font-size:22px;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums}
+.stat-unit{font-size:12px;font-weight:500;color:var(--text3);margin-left:2px}
 
-/* Tablet portrait */
+/* ── System Bars ───────────────────────────────────────────────────────────── */
+.sys-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
+.sl-item{display:flex;align-items:center;justify-content:space-between;padding:6px 0}
+.sl-k{font-size:12px;color:var(--text3)}
+.sl-v{font-size:13px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}
+.bar-wrap{height:6px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden;margin-top:8px}
+.bar-fill{height:100%;border-radius:3px;transition:width .5s,background .5s;background:var(--accent2)}
+
+/* ── Charts ────────────────────────────────────────────────────────────────── */
+.chart-container{height:200px;position:relative}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+
+/* ── Table ─────────────────────────────────────────────────────────────────── */
+.toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.chip{padding:6px 14px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text3);transition:all .2s}
+.chip.active{background:var(--accent-dim);color:var(--accent2);border-color:var(--border2)}
+.chip:hover{border-color:var(--border2)}
+.srch{background:var(--surface3);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-size:12.5px;font-family:inherit;outline:none;min-width:180px;transition:border .2s}
+.srch:focus{border-color:var(--accent)}
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl thead th{text-align:left;padding:10px 12px;font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
+body[dir="rtl"] .tbl thead th{text-align:right}
+.tbl tbody td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,0.03);vertical-align:middle}
+.tbl tbody tr:hover{background:rgba(139,92,246,0.03)}
+
+/* ── Tags & Pills ──────────────────────────────────────────────────────────── */
+.tag{display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px}
+.tag-vless{background:var(--accent-dim);color:var(--accent2);border:1px solid rgba(139,92,246,0.2)}
+.tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
+.tag-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
+.pill{display:flex;align-items:center;gap:8px;font-size:11.5px}
+.pill-used{color:var(--text2);font-weight:600;min-width:60px}
+.pill-bar{flex:1;height:5px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden;min-width:50px}
+.pill-fill{height:100%;border-radius:3px;transition:width .5s}
+.pill-lim{color:var(--text3);font-size:10.5px;min-width:50px;text-align:right}
+
+/* ── Toggle Switch ─────────────────────────────────────────────────────────── */
+.toggle{width:36px;height:20px;border-radius:10px;background:rgba(255,255,255,0.1);border:none;cursor:pointer;position:relative;transition:background .2s}
+.toggle::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .2s}
+.toggle.on{background:var(--accent)}
+.toggle.on::after{transform:translateX(16px)}
+
+/* ── Action Buttons ────────────────────────────────────────────────────────── */
+.act-btn{font-family:inherit;font-size:10.5px;font-weight:700;border-radius:6px;padding:5px 9px;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text3);transition:all .15s}
+.act-btn:hover{border-color:var(--border2);color:var(--text)}
+.act-edit:hover{color:var(--accent2);border-color:rgba(139,92,246,0.3)}
+.act-copy:hover{color:var(--green);border-color:rgba(74,222,128,0.3)}
+.act-sub:hover{color:var(--yellow);border-color:rgba(251,191,36,0.3)}
+.act-qr:hover{color:var(--accent2);border-color:rgba(139,92,246,0.3)}
+.act-del:hover{color:var(--red);border-color:rgba(248,113,113,0.3)}
+
+/* ── Mobile Cards ──────────────────────────────────────────────────────────── */
+.m-cards{display:none}
+.m-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:10px}
+.m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.m-card-acts{display:flex;gap:5px;margin-top:10px;flex-wrap:wrap}
+
+/* ── Alerts ────────────────────────────────────────────────────────────────── */
+.alerts-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:16px}
+.alert-item{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:8px;background:var(--surface3);margin-bottom:6px;font-size:12px}
+.alert-item:last-child{margin-bottom:0}
+
+/* ── Modals ────────────────────────────────────────────────────────────────── */
+.mo{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
+.mo.show{display:flex}
+.mo-box{background:var(--surface);border:1px solid var(--border2);border-radius:18px;padding:28px 24px;width:90%;max-width:420px;position:relative;animation:modalIn .25s ease}
+@keyframes modalIn{from{opacity:0;transform:scale(.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.mo-close{position:absolute;top:14px;right:14px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:8px;cursor:pointer;color:var(--text3);background:none;border:none;font-size:16px;transition:all .2s}
+.mo-close:hover{background:var(--accent-dim);color:var(--text)}
+.mo-title{font-family:'Cinzel',serif;font-size:16px;color:var(--accent2);letter-spacing:2px;margin-bottom:20px;text-align:center}
+.qr-box{background:var(--surface3);border-radius:12px;padding:16px;display:flex;justify-content:center}
+.qr-box img{max-width:100%;border-radius:8px}
+.fr{display:flex;gap:10px}
+.fs{width:100%;background:var(--surface3);border:1px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--text);font-size:14px;font-family:inherit;outline:none;cursor:pointer}
+.fs:focus{border-color:var(--accent)}
+
+/* ── Toast ─────────────────────────────────────────────────────────────────── */
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--accent2);border:1px solid var(--border2);border-radius:10px;padding:10px 18px;font-size:13px;font-weight:600;opacity:0;transition:all .3s;z-index:999;pointer-events:none}
+.toast.err{color:var(--red);border-color:rgba(248,113,113,0.3)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ── Empty State ───────────────────────────────────────────────────────────── */
+.empty{text-align:center;padding:40px 20px;color:var(--text3);font-size:14px}
+
+/* ── Mobile Bottom Nav ─────────────────────────────────────────────────────── */
+.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--border);z-index:50;padding:6px 0 env(safe-area-inset-bottom,6px)}
+.bottom-nav-inner{display:flex;justify-content:space-around;align-items:center}
+.bn-item{display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 12px;cursor:pointer;color:var(--text3);transition:color .2s;font-size:9px;font-weight:600}
+.bn-item.active{color:var(--accent2)}
+.bn-item svg{width:20px;height:20px}
+
+/* ── Responsive ────────────────────────────────────────────────────────────── */
 @media(max-width:768px){
-  .main{padding:14px 10px 72px}
-  .topbar-nav{display:none}
-  .mob-nav{display:flex!important}
+  .sidebar{transform:translateX(-100%)}
+  body[dir="rtl"] .sidebar{transform:translateX(100%)}
+  .main{margin-left:0!important;margin-right:0!important;padding:16px 14px 80px}
+  .bottom-nav{display:block}
   .d-table{display:none!important}
   .m-cards{display:block!important}
-  .grid2{grid-template-columns:1fr}
-  .page-title{font-size:15px}
-  .page-hd{margin-bottom:12px}
-  .mo-box{max-width:340px;padding:18px}
+  .stats-grid{grid-template-columns:1fr 1fr}
+  .sys-grid,.grid-2{grid-template-columns:1fr}
+  .page-title{font-size:18px}
+  .toolbar{gap:6px}
+  .srch{min-width:120px;font-size:12px;padding:6px 10px}
 }
-
-/* Large phone */
-@media(max-width:480px){
-  .stats{gap:6px}
-  .sc{padding:10px;border-radius:8px}
-  .sc-val{font-size:15px}
-  .sc-ic{width:24px;height:24px;margin-bottom:6px}
-  .sc-ic svg{width:12px;height:12px}
-  .card{padding:10px}
-  .m-card{padding:10px}
-  .m-card-acts{gap:2px}
-  .abtn{padding:3px 5px;font-size:8px}
-  .toolbar{gap:4px}
-  .chip{padding:3px 10px;font-size:10px}
-  .search{min-width:100px;font-size:10px;padding:5px 8px}
-  .btn{font-size:10px;padding:7px 12px}
-  .topbar{padding:0 10px}
-  .topbar-brand{font-size:13px}
-  .mo-box{padding:16px 14px;width:94%}
-}
-
-/* Small phone */
-@media(max-width:360px){
-  .main{padding:10px 8px 68px}
-  .stats{grid-template-columns:1fr 1fr;gap:6px}
-  .sc{padding:8px}
-  .sc-val{font-size:14px}
-  .sc-lbl{font-size:9px}
-  .page-title{font-size:14px}
-  .m-card-hd{flex-wrap:wrap}
-  .m-card-acts{width:100%;justify-content:flex-end}
-}
-
-/* Short viewport (landscape phone) */
-@media(max-height:500px) and (orientation:landscape){
-  .mob-nav{padding:4px 0}
-  .mob-btn{padding:4px 8px}
-  .mob-btn svg{width:14px;height:14px}
-  .mob-btn span{font-size:8px}
-}
-
-/* Desktop table overflow safety */
-@media(max-width:1200px){
-  .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-}
-
-/* Mobile bottom nav */
-.mob-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--border);z-index:50;padding:5px 0 env(safe-area-inset-bottom,5px)}
-.mob-nav-in{display:flex;justify-content:space-around;align-items:center}
-.mob-btn{display:flex;flex-direction:column;align-items:center;gap:1px;padding:5px 8px;cursor:pointer;color:var(--txt3);font-size:8px;font-weight:600;background:0;border:0;font-family:inherit}
-.mob-btn.on{color:var(--accent2)}
-.mob-btn svg{width:16px;height:16px}
-
-/* Login */
-.login-wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:100;background:var(--pri)}
-.login-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:32px 24px;width:90%;max-width:340px;text-align:center}
-.login-box h2{font-size:18px;font-weight:700;color:var(--accent2);margin-bottom:3px}
-.login-box .sub{font-size:11px;color:var(--txt3);margin-bottom:20px}
-.login-err{display:none;background:rgba(251,113,133,.06);border:1px solid rgba(251,113,133,.15);color:var(--red);border-radius:6px;padding:7px 10px;font-size:11px;font-weight:600;margin-bottom:10px}
-@media(max-width:360px){.login-box{padding:24px 16px;max-width:300px}}
 </style>
 </head>
 <body>
+<div class="bg-fixed"></div>
+<div class="grid-fixed"></div>
 
-<!-- Login -->
+<!-- Login Page -->
 <div class="login-wrap" id="login-page">
   <div class="login-box">
-    <div style="margin-bottom:14px">
-      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--accent2);margin:0 auto"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    <div class="login-logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      </svg>
     </div>
-    <h2>USF-PNL</h2>
-    <div class="sub">Proxy Management Panel</div>
-    <div class="login-err" id="login-err">Incorrect password</div>
-    <div class="fg" style="text-align:left">
-      <label class="fl">Password</label>
-      <input class="fi" type="password" id="login-pw" placeholder="Enter your password" onkeydown="if(event.key==='Enter')doLogin()">
+    <div class="login-title">USF-PNL</div>
+    <div class="login-sub" data-en="Secure VLESS Proxy Panel" data-fa="\u067e\u0646\u0644 \u067e\u0631\u0648\u06a9\u0633\u06cc VLESS \u0627\u0645\u0646">Secure VLESS Proxy Panel</div>
+    <div class="login-err" id="login-err" data-en="Invalid password" data-fa="\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0627\u0634\u062a\u0628\u0627\u0647 \u0627\u0633\u062a">Invalid password</div>
+    <div class="fg">
+      <label class="fl" data-en="Password" data-fa="\u0631\u0645\u0632 \u0639\u0628\u0648\u0631">Password</label>
+      <input class="fi" type="password" id="login-pw" data-ph-en="Enter panel password" data-ph-fa="\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u067e\u0646\u0644 \u0631\u0627 \u0648\u0627\u0631\u062f \u06a9\u0646\u06cc\u062f" placeholder="Enter panel password" onkeydown="if(event.key==='Enter')doLogin()">
     </div>
-    <button class="btn btn-p" style="width:100%;justify-content:center;padding:11px;font-size:12px;margin-top:2px" onclick="doLogin()">Sign In</button>
+    <button class="btn btn-accent" style="width:100%;justify-content:center;padding:13px;font-size:14px" onclick="doLogin()" data-en="Login" data-fa="\u0648\u0631\u0648\u062f">Login</button>
   </div>
 </div>
 
 <!-- Dashboard -->
-<div id="dash" style="display:none;width:100%">
-  <header class="topbar">
-    <div class="topbar-r">
-      <div class="topbar-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-      <span class="topbar-brand">USF-PNL</span>
+<div id="dashboard-page" style="display:none;width:100%">
+  <!-- Sidebar -->
+  <nav class="sidebar">
+    <div class="sb-logo" onclick="switchPage('dashboard')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      </svg>
     </div>
-    <nav class="topbar-nav">
-      <button class="nav-btn on" data-p="dashboard">Dashboard</button>
-      <button class="nav-btn" data-p="inbounds">Inbounds</button>
-      <button class="nav-btn" data-p="traffic">Traffic</button>
-      <button class="nav-btn" data-p="settings">Settings</button>
-    </nav>
-    <div class="topbar-l">
-      <button class="topbar-icon" id="theme-btn" onclick="toggleTheme()" title="Theme">
+    <div class="nav-items">
+      <div class="nav-item active" data-page="dashboard" title="Dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      </div>
+      <div class="nav-item" data-page="inbounds" title="Inbounds">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="13" y2="16"/></svg>
+      </div>
+      <div class="nav-item" data-page="traffic" title="Traffic">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      </div>
+    </div>
+    <div class="sb-bottom">
+      <div class="nav-item" onclick="toggleLang()" title="Language">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+      </div>
+      <div class="nav-item" id="theme-btn-desk" onclick="toggleTheme()" title="Theme">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-      </button>
-      <button class="topbar-icon" onclick="doLogout()" title="Logout">
+      </div>
+      <div class="nav-item" onclick="doLogout()" title="Logout">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-      </button>
+      </div>
     </div>
-  </header>
+  </nav>
 
   <main class="main">
-    <!-- Dashboard -->
-    <section class="page on" id="page-dashboard">
-      <div class="page-hd">
-        <div><div class="page-title">Dashboard</div><div class="page-sub">System overview &amp; statistics</div></div>
-        <span style="font-size:10px;color:var(--txt3)" id="last-up"></span>
-      </div>
-      <div class="alerts" id="alerts-box" style="display:none"><div id="alerts-list"></div></div>
-      <div class="stats">
-        <div class="sc"><div class="sc-ic c1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div><div class="sc-lbl">Total Traffic</div><div class="sc-val"><span id="sv-traffic">0</span> <span class="sc-unit">MB</span></div></div>
-        <div class="sc"><div class="sc-ic c2"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg></div><div class="sc-lbl">Inbounds</div><div class="sc-val" id="sv-links">0</div></div>
-        <div class="sc"><div class="sc-ic c3"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div><div class="sc-lbl">Uptime</div><div class="sc-val" id="sv-uptime">--:--:--</div></div>
-        <div class="sc"><div class="sc-ic c4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div><div class="sc-lbl">Domain</div><div class="sc-val" id="sv-domain" style="font-size:12px;word-break:break-all">--</div></div>
-      </div>
-      <div class="grid2" style="margin-bottom:16px">
-        <div class="card">
-          <div class="card-title">System Resources</div>
-          <div class="sys-row"><span class="sys-k">CPU</span><span class="sys-v" id="cpu-v">--</span></div>
-          <div class="bar-bg"><div class="bar-fg" id="cpu-b" style="width:0%"></div></div>
-          <div class="sys-row" style="margin-top:6px"><span class="sys-k">Memory</span><span class="sys-v" id="mem-v">--</span></div>
-          <div class="bar-bg"><div class="bar-fg" id="mem-b" style="width:0%"></div></div>
+    <!-- Dashboard Page -->
+    <section class="page active" id="page-dashboard">
+      <div class="page-header">
+        <div>
+          <div class="page-title" data-en="Dashboard" data-fa="\u062f\u0627\u0634\u0628\u0648\u0631\u062f">Dashboard</div>
+          <div class="page-sub" data-en="System overview &amp; statistics" data-fa="\u0646\u0645\u0627\u06cc \u06a9\u0644\u06cc \u0633\u06cc\u0633\u062a\u0645 \u0648 \u0622\u0645\u0627\u0631">System overview & statistics</div>
         </div>
-        <div class="card"><div class="card-title">Hourly Traffic</div><div class="chart-box"><canvas id="tc"></canvas></div></div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:var(--text3)" id="last-up"></span>
+        </div>
+      </div>
+
+      <div class="alerts-box" id="alerts-box" style="display:none">
+        <div id="alerts-list"></div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-icon purple">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </div>
+          <div class="stat-label" data-en="Total Traffic" data-fa="\u06a9\u0644 \u062a\u0631\u0627\u0641\u06cc\u06a9">Total Traffic</div>
+          <div class="stat-value"><span id="sv-traffic">0</span><span class="stat-unit"> MB</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon green">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+          </div>
+          <div class="stat-label" data-en="Inbounds" data-fa="\u0627\u06cc\u0646\u0628\u0627\u0646\u062f\u0647\u0627">Inbounds</div>
+          <div class="stat-value" id="sv-links">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon yellow">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          <div class="stat-label" data-en="Uptime" data-fa="\u0622\u067e\u062a\u0627\u06cc\u0645">Uptime</div>
+          <div class="stat-value" id="sv-uptime">--:--:--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon red">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          </div>
+          <div class="stat-label" data-en="Domain" data-fa="\u062f\u0627\u0645\u0646\u0647">Domain</div>
+          <div class="stat-value" id="sv-domain" style="font-size:14px;word-break:break-all">--</div>
+        </div>
+      </div>
+
+      <div class="sys-grid" style="margin-bottom:20px">
+        <div class="card">
+          <div class="card-hd"><div class="card-title" data-en="System Resources" data-fa="\u0645\u0646\u0627\u0628\u0639 \u0633\u06cc\u0633\u062a\u0645">System Resources</div></div>
+          <div class="sl-item"><span class="sl-k" data-en="CPU" data-fa="\u067e\u0631\u062f\u0627\u0632\u0646\u062f\u0647">CPU</span><span class="sl-v" id="cpu-v">--</span></div>
+          <div class="bar-wrap"><div class="bar-fill" id="cpu-b" style="width:0%"></div></div>
+          <div class="sl-item" style="margin-top:10px"><span class="sl-k" data-en="Memory" data-fa="\u062d\u0627\u0641\u0638\u0647">Memory</span><span class="sl-v" id="mem-v">--</span></div>
+          <div class="bar-wrap"><div class="bar-fill" id="mem-b" style="width:0%"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><div class="card-title" data-en="Hourly Traffic" data-fa="\u062a\u0631\u0627\u0641\u06cc\u06a9 \u0633\u0627\u0639\u062a\u06cc">Hourly Traffic</div></div>
+          <div class="chart-container"><canvas id="tc"></canvas></div>
+        </div>
       </div>
     </section>
 
-    <!-- Inbounds -->
+    <!-- Inbounds Page -->
     <section class="page" id="page-inbounds">
-      <div class="page-hd">
-        <div><div class="page-title">Inbounds</div><div class="page-sub">Manage VLESS connections</div></div>
-        <button class="btn btn-p btn-sm" onclick="showAddMo()">+ Add</button>
+      <div class="page-header">
+        <div>
+          <div class="page-title" data-en="Inbounds" data-fa="\u0627\u06cc\u0646\u0628\u0627\u0646\u062f\u0647\u0627">Inbounds</div>
+          <div class="page-sub" data-en="Manage VLESS connections" data-fa="\u0645\u062f\u06cc\u0631\u06cc\u062a \u0627\u062a\u0635\u0627\u0644\u0627\u062a VLESS">Manage VLESS connections</div>
+        </div>
+        <button class="btn btn-accent" onclick="showAddMo()" data-en="+ Add" data-fa="+ \u0627\u0641\u0632\u0648\u062f\u0646">+ Add</button>
       </div>
       <div class="toolbar">
-        <div class="chip on" data-f="all" onclick="setFilter('all',this)">All</div>
-        <div class="chip" data-f="active" onclick="setFilter('active',this)">Active</div>
-        <div class="chip" data-f="off" onclick="setFilter('off',this)">Inactive</div>
-        <input class="search" id="srch" placeholder="Search..." oninput="filterLinks()">
+        <div class="chip active" data-f="all" onclick="setFilter('all',this)" data-en="All" data-fa="\u0647\u0645\u0647">All</div>
+        <div class="chip" data-f="active" onclick="setFilter('active',this)" data-en="Active" data-fa="\u0641\u0639\u0627\u0644">Active</div>
+        <div class="chip" data-f="off" onclick="setFilter('off',this)" data-en="Disabled" data-fa="\u063a\u06cc\u0631\u0641\u0639\u0627\u0644">Disabled</div>
+        <input class="srch" id="srch" data-ph-en="Search..." data-ph-fa="\u062c\u0633\u062a\u062c\u0648..." placeholder="Search..." oninput="filterLinks()">
       </div>
       <div class="card" style="padding:0;overflow:hidden">
-        <div class="d-table tbl-wrap">
+        <div class="d-table" style="overflow-x:auto">
           <table class="tbl">
-            <thead><tr><th>#</th><th>Name</th><th>Type</th><th>Usage</th><th>Conn</th><th>Expiry</th><th>Status</th><th>Actions</th></tr></thead>
+            <thead><tr>
+              <th data-en="#" data-fa="#">#</th>
+              <th data-en="Name" data-fa="\u0646\u0627\u0645">Name</th>
+              <th data-en="Type" data-fa="\u0646\u0648\u0639">Type</th>
+              <th data-en="Usage" data-fa="\u0645\u0635\u0631\u0641">Usage</th>
+              <th data-en="IPs" data-fa="\u0622\u06cc\u200c\u067e\u06cc">IPs</th>
+              <th data-en="Expiry" data-fa="\u0627\u0646\u0642\u0636\u0627">Expiry</th>
+              <th data-en="Status" data-fa="\u0648\u0636\u0639\u06cc\u062a">Status</th>
+              <th data-en="Actions" data-fa="\u0639\u0645\u0644\u06cc\u0627\u062a">Actions</th>
+            </tr></thead>
             <tbody id="ltb"></tbody>
           </table>
         </div>
         <div class="m-cards" id="mcards"></div>
-        <div class="empty" id="lempty" style="display:none">No inbounds found</div>
+        <div class="empty" id="lempty" style="display:none" data-en="No inbounds found" data-fa="\u0647\u06cc\u0686 \u0627\u06cc\u0646\u0628\u0627\u0646\u062f\u06cc \u06cc\u0627\u0641\u062a \u0646\u0634\u062f">No inbounds found</div>
       </div>
     </section>
 
-    <!-- Traffic -->
+    <!-- Traffic Page -->
     <section class="page" id="page-traffic">
-      <div class="page-hd"><div><div class="page-title">Traffic</div><div class="page-sub">Usage statistics &amp; analytics</div></div></div>
-      <div class="grid2" style="margin-bottom:10px">
+      <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="\u062a\u0631\u0627\u0641\u06cc\u06a9">Traffic</div><div class="page-sub" data-en="Statistics &amp; inbound comparison" data-fa="\u0622\u0645\u0627\u0631 \u0648 \u0645\u0642\u0627\u06cc\u0633\u0647 \u0645\u0635\u0631\u0641 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646">Statistics & inbound comparison</div></div></div>
+      <div class="grid-2" style="margin-bottom:14px">
         <div class="card">
-          <div class="sys-row"><span class="sys-k">Total Traffic</span><span class="sys-v" id="t-tr">--</span></div>
-          <div class="sys-row"><span class="sys-k">Total Requests</span><span class="sys-v" id="t-rq">--</span></div>
-          <div class="sys-row"><span class="sys-k">Uptime</span><span class="sys-v" id="t-up">--</span></div>
+          <div class="sl-item"><span class="sl-k" data-en="Total Traffic" data-fa="\u06a9\u0644 \u062a\u0631\u0627\u0641\u06cc\u06a9">Total Traffic</span><span class="sl-v" id="t-tr">--</span></div>
+          <div class="sl-item"><span class="sl-k" data-en="Total Requests" data-fa="\u06a9\u0644 \u062f\u0631\u062e\u0648\u0627\u0633\u062a\u200c\u0647\u0627">Total Requests</span><span class="sl-v" id="t-rq">--</span></div>
+          <div class="sl-item"><span class="sl-k" data-en="Uptime" data-fa="\u0622\u067e\u062a\u0627\u06cc\u0645">Uptime</span><span class="sl-v" id="t-up">--</span></div>
         </div>
-        <div class="card"><div class="card-title">User Traffic Share</div><div class="chart-box"><canvas id="inbound-chart"></canvas></div></div>
+        <div class="card">
+          <div class="card-hd"><div class="card-title" data-en="Inbound Traffic Share" data-fa="\u0633\u0647\u0645 \u062a\u0631\u0627\u0641\u06cc\u06a9 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646">Inbound Traffic Share</div></div>
+          <div class="chart-container"><canvas id="inbound-chart"></canvas></div>
+        </div>
       </div>
-      <div class="card"><div class="card-title">Daily Traffic</div><div class="chart-box" style="height:200px"><canvas id="daily-chart"></canvas></div></div>
-    </section>
-
-    <!-- Settings -->
-    <section class="page" id="page-settings">
-      <div class="page-hd"><div><div class="page-title">Settings</div><div class="page-sub">Change panel password</div></div></div>
-      <div class="card" style="max-width:400px">
-        <div class="card-title">Change Password</div>
-        <div class="fg"><label class="fl">Current Password</label><input class="fi" type="password" id="pw-current" placeholder="********"></div>
-        <div class="fg"><label class="fl">New Password</label><input class="fi" type="password" id="pw-new" placeholder="********"></div>
-        <div class="fg"><label class="fl">Confirm New Password</label><input class="fi" type="password" id="pw-confirm" placeholder="********" onkeydown="if(event.key==='Enter')doChangePw()"></div>
-        <button class="btn btn-p" onclick="doChangePw()" style="margin-top:2px">Update Password</button>
-        <div id="pw-err" style="color:var(--red);font-size:11px;margin-top:8px;display:none"></div>
-        <div id="pw-ok" style="color:var(--green);font-size:11px;margin-top:8px;display:none">Password changed successfully</div>
+      <div class="card">
+        <div class="card-hd"><div class="card-title" data-en="Daily Traffic" data-fa="\u062a\u0631\u0627\u0641\u06cc\u06a9 \u0631\u0648\u0632\u0627\u0646\u0647">Daily Traffic</div></div>
+        <div class="chart-container" style="height:240px"><canvas id="daily-chart"></canvas></div>
       </div>
     </section>
   </main>
 
-  <!-- Mobile Nav -->
-  <div class="mob-nav">
-    <div class="mob-nav-in">
-      <button class="mob-btn on" data-p="dashboard" onclick="go('dashboard')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span>Home</span></button>
-      <button class="mob-btn" data-p="inbounds" onclick="go('inbounds')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg><span>Inbounds</span></button>
-      <button class="mob-btn" data-p="traffic" onclick="go('traffic')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span>Traffic</span></button>
-      <button class="mob-btn" data-p="settings" onclick="go('settings')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Settings</span></button>
-      <button class="mob-btn" onclick="doLogout()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg><span>Logout</span></button>
+  <!-- Bottom Nav (Mobile) -->
+  <div class="bottom-nav">
+    <div class="bottom-nav-inner">
+      <div class="bn-item active" data-page="dashboard" onclick="switchPage('dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span data-en="Home" data-fa="\u062e\u0627\u0646\u0647">Home</span>
+      </div>
+      <div class="bn-item" data-page="inbounds" onclick="switchPage('inbounds')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+        <span data-en="Inbounds" data-fa="\u0627\u06cc\u0646\u0628\u0627\u0646\u062f\u0647\u0627">Inbounds</span>
+      </div>
+      <div class="bn-item" data-page="traffic" onclick="switchPage('traffic')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <span data-en="Traffic" data-fa="\u062a\u0631\u0627\u0641\u06cc\u06a9">Traffic</span>
+      </div>
+      <div class="bn-item" onclick="toggleTheme()" id="theme-btn-mob">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        <span data-en="Theme" data-fa="\u067e\u0648\u0633\u062a\u0647">Theme</span>
+      </div>
+      <div class="bn-item" onclick="doLogout()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <span data-en="Logout" data-fa="\u062e\u0631\u0648\u062c">Logout</span>
+      </div>
     </div>
   </div>
 </div>
@@ -1294,211 +1454,291 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 <!-- Modals -->
 <div class="mo" id="mo-add" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-x" onclick="document.getElementById('mo-add').classList.remove('show')">&#10005;</button>
-    <div class="mo-title">Add Inbound</div>
-    <div class="fg"><label class="fl">Label</label><input class="fi" id="nl" placeholder="e.g. User 1"></div>
+    <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">&#10005;</button>
+    <div class="mo-title" data-en="ADD INBOUND" data-fa="\u0627\u0641\u0632\u0648\u062f\u0646 \u0627\u06cc\u0646\u0628\u0627\u0646\u062f">ADD INBOUND</div>
+    <div class="fg"><label class="fl" data-en="Remark" data-fa="\u062a\u0648\u0636\u06cc\u062d">Remark</label><input class="fi" id="nl" data-ph-en="e.g. User 1" data-ph-fa="\u0645\u062b\u0644\u0627\u064b \u06a9\u0627\u0631\u0628\u0631 \u06f1" placeholder="e.g. User 1"></div>
     <div class="fr">
-      <div class="fg"><label class="fl">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" placeholder="0 = Unlimited"></div>
-      <div class="fg" style="max-width:80px"><label class="fl">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="\u0645\u062d\u062f\u0648\u062f\u06cc\u062a \u062a\u0631\u0627\u0641\u06cc\u06a9">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = \u221e" data-ph-fa="\u06f0 = \u0646\u0627\u0645\u062d\u062f\u0648\u062f" placeholder="0 = \u221e"></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="\u0648\u0627\u062d\u062f">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
     </div>
-    <div class="fg"><label class="fl">Max Connections</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = Unlimited"></div>
-    <div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
-    <button class="btn btn-p" onclick="createLink()" style="width:100%;justify-content:center;padding:10px;margin-top:8px">Create</button>
+    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="\u062d\u062f\u0627\u06a9\u062b\u0631 \u0627\u062a\u0635\u0627\u0644">Max Connections</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = \u221e" data-ph-fa="\u06f0 = \u0646\u0627\u0645\u062d\u062f\u0648\u062f" placeholder="0 = \u221e"></div>
+    <div class="fg"><label class="fl" data-en="Days Valid" data-fa="\u0631\u0648\u0632\u0647\u0627\u06cc \u0627\u0639\u062a\u0628\u0627\u0631">Days Valid</label><input class="fi" id="nd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="\u06f0 = \u0628\u062f\u0648\u0646 \u0627\u0646\u0642\u0636\u0627" placeholder="0 = No expiry"></div>
+    <button class="btn btn-accent" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px" data-en="CREATE" data-fa="\u0627\u06cc\u062c\u0627\u062f">CREATE</button>
   </div>
 </div>
 
 <div class="mo" id="mo-edit" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-x" onclick="document.getElementById('mo-edit').classList.remove('show')">&#10005;</button>
-    <div class="mo-title" id="et">Edit Inbound</div>
+    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">&#10005;</button>
+    <div class="mo-title" id="et" data-en="EDIT INBOUND" data-fa="\u0648\u06cc\u0631\u0627\u06cc\u0634 \u0627\u06cc\u0646\u0628\u0627\u0646\u062f">EDIT INBOUND</div>
     <input type="hidden" id="eu">
-    <div class="fg"><label class="fl">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
+    <div class="fg"><label class="fl" data-en="Name" data-fa="\u0646\u0627\u0645">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
     <div class="fr">
-      <div class="fg"><label class="fl">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" placeholder="0 = Unlimited"></div>
-      <div class="fg" style="max-width:80px"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="\u0645\u062d\u062f\u0648\u062f\u06cc\u062a \u062a\u0631\u0627\u0641\u06cc\u06a9">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="0 = \u221e" data-ph-fa="\u06f0 = \u0646\u0627\u0645\u062d\u062f\u0648\u062f" placeholder="0 = \u221e"></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="\u0648\u0627\u062d\u062f">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
     </div>
-    <div class="fg"><label class="fl">Max Connections</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = Unlimited"></div>
-    <div class="fg"><label class="fl">Add Days</label><input class="fi" id="ed" type="number" min="0" placeholder="0 = No change"></div>
-    <div style="display:flex;gap:8px;margin-top:12px">
-      <button class="btn btn-p" onclick="saveEdit()" style="flex:1;justify-content:center;padding:10px">Save</button>
-      <button class="btn btn-d" onclick="resetTraf()" style="padding:10px">Reset</button>
+    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="\u062d\u062f\u0627\u06a9\u062b\u0631 \u0627\u062a\u0635\u0627\u0644">Max Connections</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = \u221e" data-ph-fa="\u06f0 = \u0646\u0627\u0645\u062d\u062f\u0648\u062f" placeholder="0 = \u221e"></div>
+    <div class="fg"><label class="fl" data-en="Extend Days" data-fa="\u0627\u0641\u0632\u0627\u06cc\u0634 \u0631\u0648\u0632\u0647\u0627">Extend Days</label><input class="fi" id="ed" type="number" min="0" data-ph-en="0 = no change" data-ph-fa="\u06f0 = \u0628\u062f\u0648\u0646 \u062a\u063a\u06cc\u06cc\u0631" placeholder="0 = no change"></div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="btn btn-accent" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px" data-en="SAVE" data-fa="\u0630\u062e\u06cc\u0631\u0647">SAVE</button>
+      <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px" data-en="Reset" data-fa="\u0628\u0627\u0632\u0646\u0634\u0627\u0646\u06cc \u062a\u0631\u0627\u0641\u06cc\u06a9">Reset</button>
     </div>
   </div>
 </div>
 
 <div class="mo" id="mo-qr" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="mo-box" style="max-width:300px">
-    <button class="mo-x" onclick="document.getElementById('mo-qr').classList.remove('show')">&#10005;</button>
-    <div class="mo-title">QR Code</div>
+  <div class="mo-box" style="max-width:340px">
+    <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">&#10005;</button>
+    <div class="mo-title" data-en="QR CODE" data-fa="\u06a9\u062f QR">QR CODE</div>
     <div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
-    <div style="display:flex;gap:8px;margin-top:12px;justify-content:center">
-      <button class="btn btn-p btn-sm" onclick="dlQR()">Download</button>
-      <button class="btn btn-g btn-sm" onclick="document.getElementById('mo-qr').classList.remove('show')">Close</button>
+    <div style="display:flex;gap:10px;margin-top:16px;justify-content:center">
+      <button class="btn btn-accent btn-sm" onclick="dlQR()" style="padding:10px 16px" data-en="Download" data-fa="\u062f\u0627\u0646\u0644\u0648\u062f">Download</button>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('mo-qr').classList.remove('show')" style="padding:10px 16px" data-en="Close" data-fa="\u0628\u0633\u062a\u0646">Close</button>
     </div>
   </div>
 </div>
 
 <script>
-function $(i){return document.getElementById(i);}
+function $(s){return document.querySelector(s);}
+function $m(id){return document.getElementById(id);}
 function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-var theme=localStorage.getItem('usf_theme')||'dark';
-var allLinks=[],cf='all',sData={},tC=null,iC=null,dC=null,isAuth=false;
 
+const langMap={
+  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},
+  fa:{edit:'\u0648\u06cc\u0631\u0627\u06cc\u0634',copy:'\u06a9\u067e\u06cc',sub:'\u0627\u0634\u062a\u0631\u0627\u06a9',qr:'QR',del:'\u062d\u0630\u0641'}
+};
+function tr(key){return(langMap[lang]&&langMap[lang][key])||langMap['en'][key]||key;}
+
+let lang=localStorage.getItem('usf_lang')||'en';
+let theme=localStorage.getItem('usf_theme')||'dark';
+let allLinks=[];
+let cf='all';
+let sData={};
+let tChart=null;
+let iChart=null;
+let dChart=null;
+let isAuthenticated=false;
+let defaultPort=443;
+
+// Theme
 function setTheme(t){
   theme=t;
-  document.body.classList.toggle('light',t==='light');
+  if(t==='light')document.body.classList.add('light-mode');
+  else document.body.classList.remove('light-mode');
   localStorage.setItem('usf_theme',t);
-  var b=$('theme-btn');
-  if(b)b.innerHTML=t==='light'
-    ?'<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>'
-    :'<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
-  if(tC)updColors();
+  const mb=$m('theme-btn-mob');
+  const db=$m('theme-btn-desk');
+  if(mb)mb.querySelector('span').textContent=lang==='fa'?(t==='light'?'\u0631\u0648\u0634\u0646':'\u062a\u0627\u0631\u06cc\u06a9'):(t==='light'?'Light':'Dark');
+  if(db){
+    db.querySelector('svg').innerHTML=t==='light'
+      ?'<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>'
+      :'<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+  }
+  updChartColors();
 }
 function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
 
-function checkAuth(){fetch('/api/dashboard').then(function(r){if(r.ok)showDash();else showLogin();}).catch(function(){showLogin();});}
-function showLogin(){isAuth=false;$('login-page').style.display='';$('dash').style.display='none';}
-function showDash(){isAuth=true;$('login-page').style.display='none';$('dash').style.display='block';initCharts();loadStats();loadLinks();}
-function doLogin(){
-  var pw=$('login-pw').value;$('login-err').style.display='none';
-  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})
-  .then(function(r){if(r.ok){$('login-pw').value='';showDash();}else $('login-err').style.display='block';})
-  .catch(function(){$('login-err').style.display='block';});
-}
-function doLogout(){fetch('/api/logout',{method:'POST'}).then(function(){showLogin();});}
-function doChangePw(){
-  var c=$('pw-current').value,n=$('pw-new').value,f=$('pw-confirm').value;
-  $('pw-err').style.display='none';$('pw-ok').style.display='none';
-  if(!c||!n||!f){$('pw-err').textContent='Please fill all fields';$('pw-err').style.display='block';return;}
-  if(n.length<4){$('pw-err').textContent='Password too short (min 4)';$('pw-err').style.display='block';return;}
-  if(n!==f){$('pw-err').textContent='Passwords do not match';$('pw-err').style.display='block';return;}
-  fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:c,new:n})})
-  .then(function(r){if(r.ok){$('pw-current').value='';$('pw-new').value='';$('pw-confirm').value='';$('pw-ok').style.display='block';}else return r.json().then(function(d){throw new Error(d.detail||'Error');});})
-  .catch(function(e){$('pw-err').textContent=e.message||'Error';$('pw-err').style.display='block';});
+// Lang
+function toggleLang(){setLang(lang==='en'?'fa':'en');}
+function setLang(l){
+  lang=l;
+  document.body.dir=l==='fa'?'rtl':'ltr';
+  document.querySelectorAll('[data-en]').forEach(el=>{
+    const v=el.getAttribute('data-'+l);
+    if(v)el.textContent=v;
+  });
+  document.querySelectorAll('[data-ph-en]').forEach(el=>{
+    const v=el.getAttribute('data-ph-'+l);
+    if(v)el.placeholder=v;
+  });
+  localStorage.setItem('usf_lang',l);
+  filterLinks();
+  setTheme(theme);
 }
 
-document.querySelectorAll('[data-p]').forEach(function(el){el.addEventListener('click',function(){go(el.dataset.p);});});
-function go(id){
-  document.querySelectorAll('.page').forEach(function(p){p.classList.remove('on');});
-  var t=$('page-'+id);if(t)t.classList.add('on');
-  document.querySelectorAll('.nav-btn[data-p]').forEach(function(n){n.classList.toggle('on',n.dataset.p===id);});
-  document.querySelectorAll('.mob-btn[data-p]').forEach(function(n){n.classList.toggle('on',n.dataset.p===id);});
+// Auth
+async function checkAuth(){
+  try{
+    const r=await fetch('/api/dashboard');
+    if(r.ok){showDashboard();}else{showLogin();}
+  }catch(e){showLogin();}
+}
+function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
+function showDashboard(){
+  isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';
+  initChart();loadStats();loadLinks();
+}
+async function doLogin(){
+  const pw=$m('login-pw').value;$m('login-err').style.display='none';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    if(r.ok){$m('login-pw').value='';showDashboard();}else{$m('login-err').style.display='block';}
+  }catch(e){$m('login-err').style.display='block';}
+}
+async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
+
+// Navigation
+document.querySelectorAll('.nav-item[data-page]').forEach(el=>{el.addEventListener('click',()=>switchPage(el.dataset.page));});
+function switchPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  const target=$m('page-'+id);if(target)target.classList.add('active');
+  document.querySelectorAll('.nav-item[data-page]').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+  document.querySelectorAll('.bn-item[data-page]').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
 }
 
-function toast(m,e){var t=$('toast');t.textContent=m;t.className='toast'+(e?' err':'')+' show';clearTimeout(t._h);t._h=setTimeout(function(){t.className='toast';},2500);}
+// Toast
+function toast(msg,err){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
 
+// Format helpers
 function fmtB(b){if(!b||b===0)return'0 B';return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';}
-function fmtL(b){if(!b||b===0)return '\u221e';var g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB';}
-function fmtE(ea){if(!ea||ea===0)return '\u221e';var d=new Date(ea)-new Date();if(d<=0)return'Expired';var dy=Math.floor(d/86400000);if(dy>0)return dy+'d';var h=Math.floor(d/3600000);if(h>0)return h+'h';return Math.floor(d/60000)+'m';}
+function fmtLim(b){if(!b||b===0)return'\u221e';const g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB';}
+function fmtExp(ea){if(!ea||ea===0)return'\u221e';const d=new Date(ea)-new Date();if(d<=0)return'Expired';const days=Math.floor(d/86400000);if(days>0)return days+'d';const hours=Math.floor(d/3600000);if(hours>0)return hours+'h';return Math.floor(d/60000)+'m';}
 
-function setFilter(f,el){cf=f;document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('on');});if(el)el.classList.add('on');filterLinks();}
+// Links
+function setFilter(filter,el){cf=filter;document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));if(el)el.classList.add('active');filterLinks();}
 function filterLinks(){
-  var q=($('srch')?($('srch').value||''):'').toLowerCase(),r=allLinks;
-  if(cf==='active')r=r.filter(function(l){return l.active;});else if(cf==='off')r=r.filter(function(l){return !l.active;});
-  if(q)r=r.filter(function(l){return l.label.toLowerCase().indexOf(q)!==-1||l.uuid.toLowerCase().indexOf(q)!==-1;});
-  render(r);
+  const q=($m('srch')?.value||'').toLowerCase();let r=allLinks;
+  if(cf==='active')r=r.filter(l=>l.active);else if(cf==='off')r=r.filter(l=>!l.active);
+  if(q)r=r.filter(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));
+  renderLinks(r);
 }
 
-function procAlerts(){
-  var al=$('alerts-list'),ab=$('alerts-box'),c=0;al.innerHTML='';
-  allLinks.forEach(function(l){
-    var u=l.used_bytes||0,lm=l.limit_bytes||0,p=lm>0?(u/lm)*100:0;
-    if(lm>0&&p>=90){c++;al.innerHTML+='<div class="alert-row"><span style="font-weight:600">\ud83d\udd4d Near limit: &apos;'+esc(l.label)+'&apos;</span><span>'+p.toFixed(1)+'%</span></div>';}
-    if(l.expires_at){var d=new Date(l.expires_at)-new Date(),dy=d/86400000;if(dy>0&&dy<=3){c++;al.innerHTML+='<div class="alert-row"><span style="font-weight:600">\u23f0 Expiring: &apos;'+esc(l.label)+'&apos;</span><span>'+dy.toFixed(1)+'d</span></div>';}}
+function processAlertsAndCharts(){
+  const alertsList=$m('alerts-list');const alertsBox=$m('alerts-box');alertsList.innerHTML='';let alertCount=0;
+  allLinks.forEach(l=>{
+    const u=l.used_bytes||0;const lim=l.limit_bytes||0;const pct=lim>0?(u/lim)*100:0;
+    if(lim>0&&pct>=90){alertCount++;alertsList.innerHTML+='<div class="alert-item"><span style="font-weight:600">\ud83d\udd34 Inbound \''+esc(l.label)+'\' is near quota limit:</span><span>'+pct.toFixed(1)+'% Used</span></div>';}
+    if(l.expires_at){const diff=new Date(l.expires_at)-new Date();const days=diff/86400000;if(days>0&&days<=3){alertCount++;alertsList.innerHTML+='<div class="alert-item"><span style="font-weight:600">\ud83d\udfe1 Inbound \''+esc(l.label)+'\' will expire soon:</span><span>'+days.toFixed(1)+' Days Left</span></div>';}}
   });
-  ab.style.display=c>0?'block':'none';
-  if(iC){var s=allLinks.slice().sort(function(a,b){return(b.used_bytes||0)-(a.used_bytes||0);}).slice(0,8);iC.data.labels=s.map(function(x){return x.label;});iC.data.datasets[0].data=s.map(function(x){return Math.round((x.used_bytes||0)/(1024*1024));});iC.update();}
+  alertsBox.style.display=alertCount>0?'block':'none';
+  if(iChart){
+    const sorted=[...allLinks].sort((a,b)=>(b.used_bytes||0)-(a.used_bytes||0)).slice(0,8);
+    iChart.data.labels=sorted.map(x=>x.label);iChart.data.datasets[0].data=sorted.map(x=>Math.round((x.used_bytes||0)/(1024*1024)));iChart.update();
+  }
 }
 
-function render(links){
-  var tb=$('ltb'),em=$('lempty'),mc=$('mcards');
-  if(!links||!links.length){tb.innerHTML='';mc.innerHTML='';em.style.display='block';procAlerts();return;}
-  em.style.display='none';var idx=links.length;
-  var R=links.map(function(l){
-    var u=l.used_bytes||0,lm=l.limit_bytes||0,p=lm>0?Math.min(100,(u/lm)*100):0;
-    var col=p>90?'var(--red)':p>70?'var(--yellow)':'var(--accent2)',ex=fmtE(l.expires_at);
-    var ec=ex==='Expired'?'var(--red)':ex==='\u221e'?'var(--txt3)':'var(--txt2)',i=idx--;
-    var cc=l.current_connections||0,mc2=l.max_connections||0;
-    return{l:l,p:p,col:col,ex:ex,ec:ec,i:i,cc:cc,mc:mc2,u:u,lm:lm};
+function renderLinks(links){
+  const tb=$m('ltb');const em=$m('lempty');const mc=$m('mcards');
+  if(!links||!links.length){tb.innerHTML='';mc.innerHTML='';em.style.display='block';const emptyText=em.getAttribute('data-'+lang)||em.getAttribute('data-en')||'No inbounds found';em.textContent=emptyText;processAlertsAndCharts();return;}
+  em.style.display='none';let idx=links.length;
+  const rows=links.map(l=>{
+    const u=l.used_bytes||0;const lim=l.limit_bytes||0;const pct=lim>0?Math.min(100,(u/lim)*100):0;
+    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--accent2)';const ex=fmtExp(l.expires_at);
+    const ec=ex==='Expired'?'var(--red)':ex==='\u221e'?'var(--text3)':'var(--text2)';const i=idx--;
+    const cc=l.current_connections||0;const mc2=l.max_connections||0;
+    return{l,pct,col,ex,ec,i,cc,mc2,u,lim};
   });
-  tb.innerHTML=R.map(function(r){
-    return '<tr><td style="color:var(--txt3);font-size:9px">'+r.i+'</td><td style="font-weight:600">'+esc(r.l.label)+'</td><td><span class="tag tag-v">VLESS</span></td><td><div class="pill"><span class="pill-used">'+fmtB(r.u)+'</span><div class="pill-bar"><div class="pill-fill" style="width:'+r.p+'%;background:'+r.col+'"></div></div><span class="pill-lim">'+fmtL(r.lm)+'</span></div></td><td style="font-size:10px;font-weight:600;color:'+(r.mc>0&&r.cc>=r.mc?'var(--red)':'var(--txt2)')+'">'+r.cc+'/'+(r.mc||'\u221e')+'</td><td style="font-size:9px;font-weight:700;color:'+r.ec+'">'+r.ex+'</td><td><span class="tag '+(r.l.active?'tag-on':'tag-off')+'">'+(r.l.active?'Active':'Inactive')+'</span></td><td><div style="display:flex;gap:2px;align-items:center;flex-wrap:wrap"><button class="toggle '+(r.l.active?'on':'')+'" data-uid="'+r.l.uuid+'" onclick="togLink(this)"></button><button class="abtn ae" onclick="showEditMo(\''+r.l.uuid+'\')">Edit</button><button class="abtn ac" onclick="cpLink(\''+esc(r.l.vless_link||'')+'\')">Copy</button><button class="abtn as" onclick="cpSub(\''+r.l.uuid+'\')">Sub</button><button class="abtn aq" onclick="showQR(\''+esc(r.l.vless_link||'')+'\')">QR</button><button class="abtn ad" onclick="delLink(\''+r.l.uuid+'\')">Del</button></div></td></tr>';
-  }).join('');
-  mc.innerHTML=R.map(function(r){
-    return '<div class="m-card"><div class="m-card-hd"><div style="display:flex;align-items:center;gap:5px;min-width:0;flex:1"><span style="font-size:9px;color:var(--txt3)">#'+r.i+'</span><span class="m-card-name">'+esc(r.l.label)+'</span><span class="tag tag-v">VLESS</span></div><button class="toggle '+(r.l.active?'on':'')+'" data-uid="'+r.l.uuid+'" onclick="togLink(this)"></button></div><div class="pill"><span class="pill-used">'+fmtB(r.u)+'</span><div class="pill-bar"><div class="pill-fill" style="width:'+r.p+'%;background:'+r.col+'"></div></div><span class="pill-lim">'+fmtL(r.lm)+'</span></div><div class="m-card-meta">\u23f3 '+r.ex+' &middot; '+r.cc+'/'+(r.mc||'\u221e')+' conn</div><div class="m-card-acts"><button class="abtn ae" onclick="showEditMo(\''+r.l.uuid+'\')">Edit</button><button class="abtn ac" onclick="cpLink(\''+esc(r.l.vless_link||'')+'\')">Copy</button><button class="abtn as" onclick="cpSub(\''+r.l.uuid+'\')">Sub</button><button class="abtn aq" onclick="showQR(\''+esc(r.l.vless_link||'')+'\')">QR</button><button class="abtn ad" onclick="delLink(\''+r.l.uuid+'\')">Del</button></div></div>';
-  }).join('');
-  procAlerts();
+  const editText=tr('edit');const copyText=tr('copy');const subText=tr('sub');const qrText=tr('qr');const delText=tr('del');
+  tb.innerHTML=rows.map(r=>'<tr><td style="color:var(--text3);font-size:10.5px">'+r.i+'</td><td style="font-weight:600">'+esc(r.l.label)+'</td><td><span class="tag tag-vless">VLESS</span></td><td><div class="pill"><span class="pill-used">'+fmtB(r.u)+'</span><div class="pill-bar"><div class="pill-fill" style="width:'+r.pct+'%;background:'+r.col+'"></div></div><span class="pill-lim">'+fmtLim(r.lim)+'</span></div></td><td style="font-size:11px;font-weight:600;color:'+(r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)')+'">'+r.cc+'/'+(r.mc2||'\u221e')+'</td><td style="font-size:10.5px;font-weight:700;color:'+r.ec+'">'+r.ex+'</td><td><span class="tag '+(r.l.active?'tag-on':'tag-off')+'">'+(r.l.active?'On':'Off')+'</span></td><td><div style="display:flex;gap:3px;align-items:center;flex-wrap:wrap"><button class="toggle '+(r.l.active?'on':'')+'" data-uid="'+r.l.uuid+'" onclick="togLink(this)"></button><button class="act-btn act-edit" onclick="showEditMo(\''+r.l.uuid+'\')">'+editText+'</button><button class="act-btn act-copy" onclick="cpLink(\''+esc(r.l.vless_link||'')+'\')">'+copyText+'</button><button class="act-btn act-sub" onclick="cpSub(\''+r.l.uuid+'\')">'+subText+'</button><button class="act-btn act-qr" onclick="showQR(\''+esc(r.l.vless_link||'')+'\')">'+qrText+'</button><button class="act-btn act-del" onclick="delLink(\''+r.l.uuid+'\')">'+delText+'</button></div></td></tr>').join('');
+  mc.innerHTML=rows.map(r=>'<div class="m-card"><div class="m-card-hd"><div style="display:flex;align-items:center;gap:7px"><span style="font-size:11px;color:var(--text3)">#'+r.i+'</span><span style="font-weight:600;font-size:14px">'+esc(r.l.label)+'</span><span class="tag tag-vless">VLESS</span></div><button class="toggle '+(r.l.active?'on':'')+'" data-uid="'+r.l.uuid+'" onclick="togLink(this)"></button></div><div class="pill"><span class="pill-used">'+fmtB(r.u)+'</span><div class="pill-bar"><div class="pill-fill" style="width:'+r.pct+'%;background:'+r.col+'"></div></div><span class="pill-lim">'+fmtLim(r.lim)+'</span></div><div style="font-size:11.5px;color:'+r.ec+';margin-top:6px;font-weight:600">\u23f3 '+r.ex+' \u00b7 '+r.cc+'/'+(r.mc2||'\u221e')+' Conn</div><div class="m-card-acts"><button class="act-btn act-edit" onclick="showEditMo(\''+r.l.uuid+'\')">'+editText+'</button><button class="act-btn act-copy" onclick="cpLink(\''+esc(r.l.vless_link||'')+'\')">'+copyText+'</button><button class="act-btn act-sub" onclick="cpSub(\''+r.l.uuid+'\')">'+subText+'</button><button class="act-btn act-qr" onclick="showQR(\''+esc(r.l.vless_link||'')+'\')">'+qrText+'</button><button class="act-btn act-del" onclick="delLink(\''+r.l.uuid+'\')">'+delText+'</button></div></div>').join('');
+  processAlertsAndCharts();
 }
 
-function togLink(el){var uid=el.dataset.uid;fetch('/api/links/'+uid+'/toggle',{method:'POST'}).then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(d){var l=allLinks.find(function(x){return x.uuid===uid;});if(l)l.active=d.active;filterLinks();loadStats();}).catch(function(){toast('Error',1);});}
-function showAddMo(){$('mo-add').classList.add('show');}
-function createLink(){
-  var label=$('nl').value.trim()||'New Link';
-  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English characters allowed',1);return;}
-  var v=parseFloat($('nv').value)||0,mc=parseInt($('nc').value)||0,d=parseInt($('nd').value)||0;
-  fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:d})})
-  .then(function(r){if(!r.ok)return r.json().catch(function(){return {};}).then(function(d){throw new Error(d.detail||'Error');});toast('Created');$('nl').value='';$('nv').value='';$('nc').value='';$('nd').value='';$('mo-add').classList.remove('show');return loadLinks();})
-  .then(function(){return loadStats();})
-  .catch(function(e){toast(e.message||'Error',1);});
+async function togLink(el){
+  const uid=el.dataset.uid;try{
+    const r=await fetch('/api/links/'+uid+'/toggle',{method:'POST'});if(!r.ok)throw new Error();
+    const d=await r.json();const l=allLinks.find(x=>x.uuid===uid);if(l)l.active=d.active;filterLinks();loadStats();
+  }catch(e){toast('Failed to toggle',true);}
 }
+
+function showAddMo(){$m('mo-add').classList.add('show');}
+
+async function createLink(){
+  const label=$m('nl').value.trim()||'New Link';
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
+  const v=parseFloat($m('nv').value)||0;const mc=parseInt($m('nc').value)||0;const days=parseInt($m('nd').value)||0;
+  try{
+    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}
+    toast('Created');$m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';$m('mo-add').classList.remove('show');await loadLinks();await loadStats();
+  }catch(e){toast(e.message||'Error creating link',true);}
+}
+
 function showEditMo(uid){
-  var l=allLinks.find(function(x){return x.uuid===uid;});if(!l)return;
-  $('eu').value=uid;$('en2').value=l.label;$('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
-  $('ec').value=l.max_connections>0?l.max_connections:'';$('ed').value='';
-  $('et').textContent='Edit: '+l.label;$('mo-edit').classList.add('show');
+  const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
+  $m('eu').value=uid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
+  $m('ec').value=l.max_connections>0?l.max_connections:'';$m('ed').value='';
+  $m('et').textContent=(lang==='fa'?'\u0648\u06cc\u0631\u0627\u06cc\u0634: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');
 }
-function saveEdit(){
-  var uid=$('eu').value,v=parseFloat($('el').value)||0,mc=parseInt($('ec').value)||0,d=parseInt($('ed').value)||0;
-  var body={limit_value:v,limit_unit:'GB',max_connections:mc};if(d>0)body.days_valid=d;
-  fetch('/api/links/'+uid,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){if(!r.ok)throw 0;toast('Updated');$('mo-edit').classList.remove('show');return loadLinks();}).catch(function(){toast('Error',1);});
-}
-function resetTraf(){
-  var uid=$('eu').value;if(!confirm('Reset traffic for this inbound?'))return;
-  fetch('/api/links/'+uid+'/reset',{method:'POST'}).then(function(r){if(!r.ok)throw 0;toast('Traffic reset');return loadLinks();}).catch(function(){toast('Error',1);});
-}
-function delLink(uid){if(!confirm('Delete this inbound?'))return;fetch('/api/links/'+uid,{method:'DELETE'}).then(function(r){if(!r.ok)throw 0;toast('Deleted');return loadLinks();}).then(function(){return loadStats();}).catch(function(){toast('Error',1);});}
-function cpLink(t){if(!t){toast('No link',1);return;}navigator.clipboard.writeText(t).then(function(){toast('Copied!');}).catch(function(){toast('Copy failed',1);});}
-function cpSub(uid){fetch('/api/links/'+uid+'/sub').then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(d){return navigator.clipboard.writeText(d.sub_url);}).then(function(){toast('Sub link copied!');}).catch(function(){toast('Error',1);});}
-function showQR(t){if(!t){toast('No data',1);return;}$('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=260x260&data='+encodeURIComponent(t);$('mo-qr').classList.add('show');}
-function dlQR(){var a=document.createElement('a');a.href=$('qr-img').src;a.download='usf-qr.png';a.click();}
 
-function loadStats(){
-  fetch('/api/dashboard').then(function(r){if(r.status===401){showLogin();return;}if(!r.ok)throw 0;return r.json();}).then(function(d){
-    sData=d;
-    $('sv-traffic').innerHTML=(d.total_traffic_mb||0)+' <span class="sc-unit">MB</span>';
-    $('sv-links').textContent=d.links_count||0;$('sv-uptime').textContent=d.uptime||'--:--:--';
-    $('sv-domain').textContent=d.domain||'--';$('last-up').textContent='Updated '+new Date().toLocaleTimeString();
-    if($('t-tr'))$('t-tr').textContent=(d.total_traffic_mb||0)+' MB';
-    if($('t-rq'))$('t-rq').textContent=(d.total_requests||0).toLocaleString();
-    if($('t-up'))$('t-up').textContent=d.uptime||'--:--:--';
-    if(d.cpu_percent!==undefined&&d.cpu_percent>0){var c=d.cpu_percent,cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--accent2)';$('cpu-v').textContent=c.toFixed(1)+'%';$('cpu-v').style.color=cc;$('cpu-b').style.width=c+'%';$('cpu-b').style.background=cc;}else{$('cpu-v').textContent='N/A';}
-    if(d.memory_percent!==undefined&&d.memory_percent>0){var m=d.memory_percent,mc=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green)';$('mem-v').textContent=m.toFixed(1)+'%';$('mem-v').style.color=mc;$('mem-b').style.width=m+'%';$('mem-b').style.background=mc;}else{$('mem-v').textContent='N/A';}
-    updChart();updDaily();
-  }).catch(function(){});
+async function saveEdit(){
+  const uid=$m('eu').value;const v=parseFloat($m('el').value)||0;const mc=parseInt($m('ec').value)||0;const days=parseInt($m('ed').value)||0;
+  const body={limit_value:v,limit_unit:'GB',max_connections:mc};if(days>0)body.days_valid=days;
+  try{
+    const r=await fetch('/api/links/'+uid,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok)throw new Error();toast('Updated');$m('mo-edit').classList.remove('show');await loadLinks();
+  }catch(e){toast('Error updating',true);}
 }
-function loadLinks(){fetch('/api/links').then(function(r){if(r.status===401){showLogin();return;}if(!r.ok)throw 0;return r.json();}).then(function(d){allLinks=d.links||[];filterLinks();}).catch(function(){});}
 
-function initCharts(){
-  var ctx=$('tc');if(!ctx||tC)return;
-  tC=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(6,182,212,.5)',borderColor:'#06b6d4',borderWidth:1,borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(6,182,212,.3)',font:{size:9}}},y:{grid:{color:'rgba(148,163,184,.03)'},ticks:{color:'rgba(6,182,212,.3)',font:{size:9},callback:function(v){return v+' MB';}},beginAtZero:true}}}});
-  var c2=$('inbound-chart');if(c2&&!iC){iC=new Chart(c2,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:['#06b6d4','#34d399','#fbbf24','#fb7185','#38bdf8','#ec4899','#f43f5e','#22d3ee'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,position:'right',labels:{color:'rgba(226,232,240,.5)',font:{size:9},boxWidth:10,padding:8}}}}});}
-  var c3=$('daily-chart');if(c3&&!dC){dC=new Chart(c3,{type:'line',data:{labels:[],datasets:[{label:'MB',data:[],borderColor:'#06b6d4',backgroundColor:'rgba(6,182,212,.06)',fill:true,tension:.4,pointRadius:2,pointBackgroundColor:'#06b6d4',borderWidth:1.5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(6,182,212,.3)',font:{size:9}}},y:{grid:{color:'rgba(148,163,184,.03)'},ticks:{color:'rgba(6,182,212,.3)',font:{size:9},callback:function(v){return v+' MB';}},beginAtZero:true}}}});}
-  updColors();
+async function resetTraf(){
+  const uid=$m('eu').value;if(!confirm('Reset traffic for this inbound?'))return;
+  try{const r=await fetch('/api/links/'+uid+'/reset',{method:'POST'});if(!r.ok)throw new Error();toast('Traffic reset');await loadLinks();}catch(e){toast('Error resetting',true);}
 }
-function updColors(){
-  if(!tC)return;var c=theme==='light'?'rgba(0,0,0,.35)':'rgba(6,182,212,.3)',g=theme==='light'?'rgba(0,0,0,.05)':'rgba(148,163,184,.03)';
-  tC.options.scales.x.ticks.color=c;tC.options.scales.y.ticks.color=c;tC.options.scales.y.grid.color=g;tC.update();
-  if(dC){dC.options.scales.x.ticks.color=c;dC.options.scales.y.ticks.color=c;dC.options.scales.y.grid.color=g;dC.update();}
-}
-function updChart(){if(!tC||!sData.hourly_traffic)return;var e=Object.entries(sData.hourly_traffic).sort(function(a,b){return a[0].localeCompare(b[0]);}).slice(-12);tC.data.labels=e.map(function(x){return x[0];});tC.data.datasets[0].data=e.map(function(x){return Math.round(x[1]/1048576);});tC.update();}
-function updDaily(){if(!dC||!sData.daily_traffic)return;var e=Object.entries(sData.daily_traffic).sort(function(a,b){return a[0].localeCompare(b[0]);}).slice(-14);dC.data.labels=e.map(function(x){return x[0];});dC.data.datasets[0].data=e.map(function(x){return Math.round(x[1]/1048576);});dC.update();}
 
-setTheme(theme);checkAuth();
-var _si;function startPoll(){if(_si)clearInterval(_si);_si=setInterval(function(){if(isAuth){loadStats();loadLinks();}},30000);}startPoll();
+async function delLink(uid){
+  if(!confirm('Delete this inbound?'))return;
+  try{const r=await fetch('/api/links/'+uid,{method:'DELETE'});if(!r.ok)throw new Error();toast('Deleted');await loadLinks();await loadStats();}catch(e){toast('Error deleting',true);}
+}
+
+function cpLink(txt){if(!txt){toast('No link to copy',true);return;}navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed to copy',true));}
+
+async function cpSub(uid){
+  try{const r=await fetch('/api/links/'+uid+'/sub');if(!r.ok)throw new Error();const d=await r.json();await navigator.clipboard.writeText(d.sub_url);toast('Sub URL copied!');}catch(e){toast('Failed to copy',true);}
+}
+
+function showQR(txt){if(!txt){toast('No QR data',true);return;}$m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='usf-qr.png';a.click();}
+
+// Stats API
+async function loadStats(){
+  try{
+    const r=await fetch('/api/dashboard');if(r.status===401){showLogin();return;}if(!r.ok)throw new Error();sData=await r.json();
+    $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
+    $m('sv-links').textContent=sData.links_count||0;$m('sv-uptime').textContent=sData.uptime||'--:--:--';
+    $m('sv-domain').textContent=sData.domain||'--';$m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
+    if($m('t-tr'))$m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';
+    if($m('t-rq'))$m('t-rq').textContent=(sData.total_requests||0).toLocaleString();
+    if($m('t-up'))$m('t-up').textContent=sData.uptime||'--:--:--';
+    if(sData.cpu_percent!==undefined&&sData.cpu_percent>0){
+      const c=sData.cpu_percent;const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--accent2)';
+      $m('cpu-v').textContent=c.toFixed(1)+'%';$m('cpu-v').style.color=cc;$m('cpu-b').style.width=c+'%';$m('cpu-b').style.background=cc;
+    }else{$m('cpu-v').textContent='N/A';}
+    if(sData.memory_percent!==undefined&&sData.memory_percent>0){
+      const m=sData.memory_percent;const mc2=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green)';
+      $m('mem-v').textContent=m.toFixed(1)+'%';$m('mem-v').style.color=mc2;$m('mem-b').style.width=m+'%';$m('mem-b').style.background=mc2;
+    }else{$m('mem-v').textContent='N/A';}
+    updChart();updDailyChart();
+  }catch(e){}
+}
+
+async function loadLinks(){
+  try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)throw new Error();const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){}
+}
+
+// Chart
+function initChart(){
+  const ctx=$m('tc');if(!ctx||tChart)return;
+  tChart=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(139,92,246,0.55)',borderColor:'#8B5CF6',borderWidth:1,borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(139,92,246,0.3)',font:{size:10}}},y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba(139,92,246,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}}}});
+  const ctx2=$m('inbound-chart');if(ctx2&&!iChart){iChart=new Chart(ctx2,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:['#8B5CF6','#4ade80','#fbbf24','#f87171','#38bdf8','#ec4899','#f43f5e','#A78BFA'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,position:'right',labels:{color:'rgba(255,255,255,0.6)',font:{size:10}}}}}});}
+  const ctx3=$m('daily-chart');if(ctx3&&!dChart){dChart=new Chart(ctx3,{type:'line',data:{labels:[],datasets:[{label:'MB',data:[],borderColor:'#8B5CF6',backgroundColor:'rgba(139,92,246,0.1)',fill:true,tension:0.4,pointRadius:3,pointBackgroundColor:'#8B5CF6',borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(139,92,246,0.3)',font:{size:10}}},y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba(139,92,246,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}}}});}
+  updChartColors();
+}
+function updChartColors(){
+  if(!tChart)return;const col=theme==='light'?'rgba(0,0,0,0.5)':'rgba(139,92,246,0.4)';const gridCol=theme==='light'?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.06)';
+  tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.options.scales.y.grid.color=gridCol;tChart.update();
+  if(dChart){dChart.options.scales.x.ticks.color=col;dChart.options.scales.y.ticks.color=col;dChart.options.scales.y.grid.color=gridCol;dChart.update();}
+}
+function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
+function updDailyChart(){if(!dChart||!sData.daily_traffic)return;const entries=Object.entries(sData.daily_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-14);dChart.data.labels=entries.map(x=>x[0]);dChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));dChart.update();}
+
+// Init
+setTheme(theme);setLang(lang);checkAuth();
+let statsInterval=null;
+function startPolling(){if(statsInterval)clearInterval(statsInterval);statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);}
+startPolling();
 </script>
 </body>
 </html>"""
-
 
 # ── Page Routes ───────────────────────────────────────────────────────────────
 @app.get("/login", response_class=HTMLResponse)

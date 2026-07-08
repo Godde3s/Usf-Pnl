@@ -16,4 +16,4 @@ COPY --chown=user . /app
 EXPOSE 7860
 
 ENTRYPOINT ["tini", "--"]
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1", "--log-level", "warning"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860} --workers 1 --log-level warning"]
